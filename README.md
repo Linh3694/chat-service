@@ -129,6 +129,7 @@ npm start
 Service sử dụng các DocTypes:
 
 ### ERP Chat
+
 - `name` - ID chat (required)
 - `chat_name` - Tên chat
 - `participants` - Danh sách participants (JSON)
@@ -140,6 +141,7 @@ Service sử dụng các DocTypes:
 - `archived` - Trạng thái archived
 
 ### ERP Chat Message
+
 - `name` - ID tin nhắn (required)
 - `chat` - ID chat (required)
 - `sender` - ID người gửi (required)
@@ -154,6 +156,7 @@ Service sử dụng các DocTypes:
 - `is_pinned` - Đã ghim chưa
 
 ### ERP Chat Attachment
+
 - `name` - ID attachment
 - `chat` - ID chat
 - `message` - ID tin nhắn
@@ -164,6 +167,7 @@ Service sử dụng các DocTypes:
 - `uploaded_by` - Người upload
 
 ### ERP Message Reaction
+
 - `name` - ID reaction
 - `message` - ID tin nhắn
 - `user` - ID user
@@ -215,4 +219,4 @@ RUN npm install --production
 COPY . .
 EXPOSE 5005
 CMD ["npm", "start"]
-``` 
+```
