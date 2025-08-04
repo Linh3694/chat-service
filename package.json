@@ -1,0 +1,31 @@
+{
+  "name": "chat-service",
+  "version": "1.0.0",
+  "description": "Chat Microservice tương thích với Frappe",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mysql2": "^3.6.0",
+    "redis": "^4.6.8",
+    "socket.io": "^4.7.2",
+    "@socket.io/redis-adapter": "^2.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "moment": "^2.29.4",
+    "node-cron": "^3.0.2",
+    "axios": "^1.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": ["chat", "messaging", "microservice", "frappe", "realtime"],
+  "author": "Wellspring",
+  "license": "MIT"
+}
