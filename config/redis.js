@@ -6,6 +6,8 @@ class RedisClient {
     this.client = null;
     this.pubClient = null;
     this.subClient = null;
+    this.publishers = new Map();
+    this.subscribers = new Map();
   }
 
   async connect() {
@@ -30,15 +32,231 @@ class RedisClient {
 
       this.subClient = this.pubClient.duplicate();
 
+      // Service-specific publishers
+      this.publishers.set('chat', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
+      this.publishers.set('notification', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
+      this.publishers.set('user', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
+      // Service-specific subscribers
+      this.subscribers.set('chat', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
+      this.subscribers.set('notification', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
+      this.subscribers.set('user', createClient({
+        socket: { host: process.env.REDIS_HOST, port: process.env.REDIS_PORT },
+        password: process.env.REDIS_PASSWORD,
+      }));
+
       await this.client.connect();
       await this.pubClient.connect();
       await this.subClient.connect();
 
+      // Connect all publishers and subscribers
+      for (const [name, client] of this.publishers) {
+        await client.connect();
+      }
+
+      for (const [name, client] of this.subscribers) {
+        await client.connect();
+      }
+
       console.log('✅ [Chat Service] Redis connected successfully');
+      
+      // Setup service subscriptions
+      await this.setupServiceSubscriptions();
+
     } catch (error) {
       console.error('❌ [Chat Service] Redis connection failed:', error.message);
       throw error;
     }
+  }
+
+  async setupServiceSubscriptions() {
+    try {
+      // Subscribe to notification events
+      await this.subscribers.get('notification').subscribe(process.env.REDIS_NOTIFICATION_CHANNEL, (message) => {
+        this.handleNotificationEvent(message);
+      });
+
+      // Subscribe to user events
+      await this.subscribers.get('user').subscribe(process.env.REDIS_USER_CHANNEL, (message) => {
+        this.handleUserEvent(message);
+      });
+
+      console.log('✅ [Chat Service] Service subscriptions setup complete');
+    } catch (error) {
+      console.error('❌ [Chat Service] Failed to setup service subscriptions:', error);
+    }
+  }
+
+  async handleNotificationEvent(message) {
+    try {
+      const data = JSON.parse(message);
+      console.log('📢 [Chat Service] Received notification event:', data);
+
+      // Handle different notification types
+      switch (data.type) {
+        case 'user_online':
+          await this.handleUserOnlineNotification(data);
+          break;
+        case 'user_offline':
+          await this.handleUserOfflineNotification(data);
+          break;
+        case 'message_notification':
+          await this.handleMessageNotification(data);
+          break;
+        default:
+          console.log('📢 [Chat Service] Unknown notification type:', data.type);
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Error handling notification event:', error);
+    }
+  }
+
+  async handleUserEvent(message) {
+    try {
+      const data = JSON.parse(message);
+      console.log('👤 [Chat Service] Received user event:', data);
+
+      // Handle different user event types
+      switch (data.type) {
+        case 'user_created':
+          await this.handleUserCreated(data);
+          break;
+        case 'user_updated':
+          await this.handleUserUpdated(data);
+          break;
+        case 'user_deleted':
+          await this.handleUserDeleted(data);
+          break;
+        default:
+          console.log('👤 [Chat Service] Unknown user event type:', data.type);
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Error handling user event:', error);
+    }
+  }
+
+  async handleUserOnlineNotification(data) {
+    // Update user online status in chat service
+    await this.setUserOnline(data.user_id, data.socket_id);
+    
+    // Broadcast to connected clients
+    const io = global.io; // Access global io instance
+    if (io) {
+      io.emit('user_online', {
+        userId: data.user_id,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  async handleUserOfflineNotification(data) {
+    // Update user offline status in chat service
+    await this.setUserOffline(data.user_id);
+    
+    // Broadcast to connected clients
+    const io = global.io;
+    if (io) {
+      io.emit('user_offline', {
+        userId: data.user_id,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  async handleMessageNotification(data) {
+    // Handle message notifications from other services
+    const io = global.io;
+    if (io) {
+      io.to(`user:${data.recipient_id}`).emit('new_notification', {
+        type: 'message',
+        sender: data.sender_id,
+        chat_id: data.chat_id,
+        message_preview: data.message_preview,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  async handleUserCreated(data) {
+    // Handle user creation event
+    console.log('👤 [Chat Service] User created:', data.user_id);
+  }
+
+  async handleUserUpdated(data) {
+    // Handle user update event
+    console.log('👤 [Chat Service] User updated:', data.user_id);
+  }
+
+  async handleUserDeleted(data) {
+    // Handle user deletion event
+    console.log('👤 [Chat Service] User deleted:', data.user_id);
+  }
+
+  // Publish events to other services
+  async publishToService(service, eventType, data) {
+    try {
+      const publisher = this.publishers.get(service);
+      if (!publisher) {
+        throw new Error(`Publisher not found for service: ${service}`);
+      }
+
+      const message = {
+        service: 'chat-service',
+        type: eventType,
+        data: data,
+        timestamp: new Date().toISOString()
+      };
+
+      const channel = this.getChannelForService(service);
+      await publisher.publish(channel, JSON.stringify(message));
+      
+      console.log(`📤 [Chat Service] Published ${eventType} to ${service}`);
+    } catch (error) {
+      console.error(`❌ [Chat Service] Failed to publish to ${service}:`, error);
+    }
+  }
+
+  getChannelForService(service) {
+    const channels = {
+      'notification': process.env.REDIS_NOTIFICATION_CHANNEL,
+      'user': process.env.REDIS_USER_CHANNEL,
+      'chat': process.env.REDIS_CHAT_CHANNEL
+    };
+    return channels[service] || process.env.REDIS_CHAT_CHANNEL;
+  }
+
+  // Enhanced chat event publishing
+  async publishChatEvent(eventType, data) {
+    await this.publishToService('notification', eventType, {
+      ...data,
+      source: 'chat-service'
+    });
+  }
+
+  async publishUserEvent(eventType, data) {
+    await this.publishToService('user', eventType, {
+      ...data,
+      source: 'chat-service'
+    });
   }
 
   async set(key, value, ttl = null) {
@@ -306,6 +524,15 @@ class RedisClient {
     if (this.client) await this.client.disconnect();
     if (this.pubClient) await this.pubClient.disconnect();
     if (this.subClient) await this.subClient.disconnect();
+    
+    // Disconnect all publishers and subscribers
+    for (const [name, client] of this.publishers) {
+      await client.disconnect();
+    }
+    
+    for (const [name, client] of this.subscribers) {
+      await client.disconnect();
+    }
   }
 }
 

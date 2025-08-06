@@ -1,340 +1,367 @@
-const mysql = require('mysql2/promise');
-const { ChatDatabase } = require('../models/chatModels');
+const { MongoClient } = require('mongodb');
+const mongoose = require('mongoose');
 require('dotenv').config({ path: './config.env' });
 
 class Database {
   constructor() {
-    this.pool = null;
-    this.chatDb = null;
+    this.client = null;
+    this.db = null;
+    this.isConnected = false;
   }
 
   async connect() {
     try {
-      this.pool = mysql.createPool({
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD,
-        database: process.env.DB_NAME,
-        waitForConnections: true,
-        connectionLimit: 10,
-        queueLimit: 0,
-        acquireTimeout: 60000,
-        timeout: 60000,
-        reconnect: true,
-        charset: 'utf8mb4'
+      // Connect to MongoDB
+      this.client = new MongoClient(process.env.MONGODB_URI, {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000,
       });
 
-      // Test connection
-      const connection = await this.pool.getConnection();
-      console.log('✅ [Chat Service] MariaDB connected successfully');
-      connection.release();
+      await this.client.connect();
+      this.db = this.client.db(process.env.MONGODB_DB_NAME);
+      this.isConnected = true;
 
-      // Initialize chat database helper
-      this.chatDb = new ChatDatabase(this);
+      console.log('✅ [Chat Service] MongoDB connected successfully');
 
-      // Auto-initialize tables in development
+      // Initialize collections
+      await this.initializeCollections();
+
+      // Auto-initialize sample data in development
       if (process.env.NODE_ENV !== 'production') {
-        await this.chatDb.initializeTables();
-        await this.chatDb.createSampleData();
+        await this.createSampleData();
       }
 
     } catch (error) {
-      console.error('❌ [Chat Service] MariaDB connection failed:', error.message);
+      console.error('❌ [Chat Service] MongoDB connection failed:', error.message);
       throw error;
     }
   }
 
-  async query(sql, params = []) {
+  async initializeCollections() {
     try {
-      const [rows] = await this.pool.execute(sql, params);
-      return rows;
+      // Create collections if they don't exist
+      const collections = [
+        'chats',
+        'messages', 
+        'attachments',
+        'reactions',
+        'users',
+        'message_history'
+      ];
+
+      for (const collectionName of collections) {
+        await this.db.createCollection(collectionName);
+      }
+
+      // Create indexes for better performance
+      await this.createIndexes();
+
+      console.log('✅ [Chat Service] Collections initialized');
     } catch (error) {
-      console.error('Database query error:', error);
-      console.error('SQL:', sql);
-      console.error('Params:', params);
-      throw error;
+      console.error('❌ [Chat Service] Failed to initialize collections:', error);
     }
   }
 
-  async transaction(callback) {
-    const connection = await this.pool.getConnection();
+  async createIndexes() {
     try {
-      await connection.beginTransaction();
-      const result = await callback(connection);
-      await connection.commit();
-      return result;
+      // Chat indexes
+      await this.db.collection('chats').createIndex({ participants: 1 });
+      await this.db.collection('chats').createIndex({ updated_at: -1 });
+      await this.db.collection('chats').createIndex({ archived: 1 });
+
+      // Message indexes
+      await this.db.collection('messages').createIndex({ chat: 1, sent_at: -1 });
+      await this.db.collection('messages').createIndex({ sender: 1 });
+      await this.db.collection('messages').createIndex({ is_deleted: 1 });
+      await this.db.collection('messages').createIndex({ message: 'text' });
+
+      // User indexes
+      await this.db.collection('users').createIndex({ name: 1 }, { unique: true });
+      await this.db.collection('users').createIndex({ email: 1 });
+
+      // Reaction indexes
+      await this.db.collection('reactions').createIndex({ message: 1, user: 1 });
+
+      console.log('✅ [Chat Service] Indexes created');
     } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
+      console.error('❌ [Chat Service] Failed to create indexes:', error);
     }
   }
 
-  // Frappe-style methods with enhanced features
-  async insert(doctype, doc) {
-    const fields = Object.keys(doc);
-    const values = Object.values(doc);
-    const placeholders = fields.map(() => '?').join(',');
-    
-    const sql = `INSERT INTO \`tab${doctype}\` (${fields.map(f => '`' + f + '`').join(',')}) VALUES (${placeholders})`;
-    const result = await this.query(sql, values);
-    return result.insertId;
-  }
+  async createSampleData() {
+    try {
+      // Check if sample data already exists
+      const chatCount = await this.db.collection('chats').countDocuments();
+      if (chatCount > 0) {
+        console.log('📝 [Chat Service] Sample data already exists, skipping...');
+        return;
+      }
 
-  async update(doctype, name, doc) {
-    const fields = Object.keys(doc);
-    const values = Object.values(doc);
-    const setClause = fields.map(f => '`' + f + '` = ?').join(',');
-    
-    const sql = `UPDATE \`tab${doctype}\` SET ${setClause} WHERE name = ?`;
-    await this.query(sql, [...values, name]);
-    return true;
-  }
-
-  async get(doctype, name, fields = '*') {
-    const fieldList = Array.isArray(fields) ? fields.map(f => '`' + f + '`').join(',') : fields;
-    const sql = `SELECT ${fieldList} FROM \`tab${doctype}\` WHERE name = ?`;
-    const rows = await this.query(sql, [name]);
-    return rows[0] || null;
-  }
-
-  async getAll(doctype, filters = {}, fields = '*', orderBy = 'modified DESC', limit = null) {
-    const fieldList = Array.isArray(fields) ? fields.map(f => '`' + f + '`').join(',') : fields;
-    let sql = `SELECT ${fieldList} FROM \`tab${doctype}\``;
-    const params = [];
-
-    // Build WHERE clause
-    if (Object.keys(filters).length > 0) {
-      const conditions = [];
-      for (const [key, value] of Object.entries(filters)) {
-        if (Array.isArray(value) && value[0] === 'between') {
-          conditions.push(`\`${key}\` BETWEEN ? AND ?`);
-          params.push(value[1], value[2]);
-        } else if (Array.isArray(value) && value[0] === 'in') {
-          const placeholders = value[1].map(() => '?').join(',');
-          conditions.push(`\`${key}\` IN (${placeholders})`);
-          params.push(...value[1]);
-        } else if (Array.isArray(value) && value[0] === 'like') {
-          conditions.push(`\`${key}\` LIKE ?`);
-          params.push(value[1]);
-        } else if (Array.isArray(value) && value[0] === 'not_null') {
-          conditions.push(`\`${key}\` IS NOT NULL`);
-        } else if (Array.isArray(value) && value[0] === 'null') {
-          conditions.push(`\`${key}\` IS NULL`);
-        } else {
-          conditions.push(`\`${key}\` = ?`);
-          params.push(value);
+      // Create sample users
+      const sampleUsers = [
+        {
+          name: 'admin',
+          full_name: 'Administrator',
+          email: 'admin@wellspring.edu.vn',
+          enabled: 1,
+          avatar_url: null,
+          created_at: new Date(),
+          updated_at: new Date()
+        },
+        {
+          name: 'teacher1',
+          full_name: 'Teacher One',
+          email: 'teacher1@wellspring.edu.vn',
+          enabled: 1,
+          avatar_url: null,
+          created_at: new Date(),
+          updated_at: new Date()
+        },
+        {
+          name: 'student1',
+          full_name: 'Student One',
+          email: 'student1@wellspring.edu.vn',
+          enabled: 1,
+          avatar_url: null,
+          created_at: new Date(),
+          updated_at: new Date()
         }
-      }
-      sql += ' WHERE ' + conditions.join(' AND ');
-    }
+      ];
 
-    // Add ORDER BY
-    if (orderBy) {
-      sql += ` ORDER BY ${orderBy}`;
-    }
+      await this.db.collection('users').insertMany(sampleUsers);
 
-    // Add LIMIT
-    if (limit) {
-      sql += ` LIMIT ?`;
-      params.push(limit);
-    }
+      // Create sample chat
+      const sampleChat = {
+        name: 'CHAT-SAMPLE-001',
+        chat_name: 'Sample Chat',
+        participants: ['admin', 'teacher1'],
+        chat_type: 'direct',
+        is_group: 0,
+        message_count: 0,
+        creator: 'admin',
+        archived: 0,
+        created_at: new Date(),
+        updated_at: new Date()
+      };
 
-    return await this.query(sql, params);
+      await this.db.collection('chats').insertOne(sampleChat);
+
+      console.log('✅ [Chat Service] Sample data created');
+    } catch (error) {
+      console.error('❌ [Chat Service] Failed to create sample data:', error);
+    }
   }
 
-  async delete(doctype, name) {
-    const sql = `DELETE FROM \`tab${doctype}\` WHERE name = ?`;
-    await this.query(sql, [name]);
-    return true;
-  }
-
-  async exists(doctype, filters) {
-    const conditions = [];
-    const params = [];
-    
-    for (const [key, value] of Object.entries(filters)) {
-      conditions.push(`\`${key}\` = ?`);
-      params.push(value);
+  // Generic CRUD operations
+  async insert(collection, doc) {
+    try {
+      const result = await this.db.collection(collection).insertOne(doc);
+      return result.insertedId;
+    } catch (error) {
+      console.error(`Database insert error in ${collection}:`, error);
+      throw error;
     }
-    
-    const sql = `SELECT COUNT(*) as count FROM \`tab${doctype}\` WHERE ${conditions.join(' AND ')}`;
-    const result = await this.query(sql, params);
-    return result[0].count > 0;
   }
 
-  // Enhanced search methods for chat
-  async searchChats(userId, query, limit = 20) {
-    const sql = `
-      SELECT c.*, 
-             MATCH(c.chat_name, c.description) AGAINST(? IN NATURAL LANGUAGE MODE) as relevance
-      FROM \`tabERP Chat\` c
-      WHERE JSON_CONTAINS(c.participants, ?) 
-      AND c.archived = 0
-      AND (
-        MATCH(c.chat_name, c.description) AGAINST(? IN NATURAL LANGUAGE MODE)
-        OR c.chat_name LIKE ?
-      )
-      ORDER BY relevance DESC, c.updated_at DESC
-      LIMIT ?
-    `;
-    
-    const searchTerm = `%${query}%`;
-    return await this.query(sql, [query, JSON.stringify(userId), query, searchTerm, limit]);
-  }
-
-  async searchMessages(userId, query, chatId = null, limit = 50) {
-    let sql = `
-      SELECT m.*, c.chat_name,
-             MATCH(m.message) AGAINST(? IN NATURAL LANGUAGE MODE) as relevance
-      FROM \`tabERP Chat Message\` m
-      JOIN \`tabERP Chat\` c ON m.chat = c.name
-      WHERE JSON_CONTAINS(c.participants, ?)
-      AND m.is_deleted = 0
-      AND (m.deleted_for IS NULL OR JSON_SEARCH(m.deleted_for, 'one', ?) IS NULL)
-      AND MATCH(m.message) AGAINST(? IN NATURAL LANGUAGE MODE)
-    `;
-    
-    const params = [query, JSON.stringify(userId), userId, query];
-    
-    if (chatId) {
-      sql += ` AND m.chat = ?`;
-      params.push(chatId);
+  async update(collection, filter, update) {
+    try {
+      const result = await this.db.collection(collection).updateOne(filter, { $set: update });
+      return result.modifiedCount > 0;
+    } catch (error) {
+      console.error(`Database update error in ${collection}:`, error);
+      throw error;
     }
-    
-    sql += ` ORDER BY relevance DESC, m.sent_at DESC LIMIT ?`;
-    params.push(limit);
-    
-    return await this.query(sql, params);
   }
 
-  // Chat-specific helper methods
+  async get(collection, filter) {
+    try {
+      return await this.db.collection(collection).findOne(filter);
+    } catch (error) {
+      console.error(`Database get error in ${collection}:`, error);
+      throw error;
+    }
+  }
+
+  async getAll(collection, filter = {}, options = {}) {
+    try {
+      const { sort = { updated_at: -1 }, limit = null, skip = 0 } = options;
+      let query = this.db.collection(collection).find(filter);
+
+      if (sort) query = query.sort(sort);
+      if (skip) query = query.skip(skip);
+      if (limit) query = query.limit(limit);
+
+      return await query.toArray();
+    } catch (error) {
+      console.error(`Database getAll error in ${collection}:`, error);
+      throw error;
+    }
+  }
+
+  async delete(collection, filter) {
+    try {
+      const result = await this.db.collection(collection).deleteOne(filter);
+      return result.deletedCount > 0;
+    } catch (error) {
+      console.error(`Database delete error in ${collection}:`, error);
+      throw error;
+    }
+  }
+
+  async exists(collection, filter) {
+    try {
+      const count = await this.db.collection(collection).countDocuments(filter);
+      return count > 0;
+    } catch (error) {
+      console.error(`Database exists error in ${collection}:`, error);
+      throw error;
+    }
+  }
+
+  // Chat-specific methods
   async getChatParticipants(chatId) {
-    const sql = `
-      SELECT u.name, u.full_name, u.email, u.avatar_url, u.enabled
-      FROM \`tabUser\` u
-      JOIN \`tabERP Chat\` c ON JSON_CONTAINS(c.participants, JSON_QUOTE(u.name))
-      WHERE c.name = ? AND u.enabled = 1
-    `;
-    
-    return await this.query(sql, [chatId]);
+    try {
+      const chat = await this.get('chats', { name: chatId });
+      if (!chat) return [];
+
+      const participants = await this.getAll('users', {
+        name: { $in: chat.participants }
+      });
+
+      return participants;
+    } catch (error) {
+      console.error('Error getting chat participants:', error);
+      return [];
+    }
   }
 
   async getUnreadMessageCount(userId, chatId = null) {
-    let sql = `
-      SELECT COUNT(*) as count
-      FROM \`tabERP Chat Message\` m
-      JOIN \`tabERP Chat\` c ON m.chat = c.name
-      WHERE JSON_CONTAINS(c.participants, ?)
-      AND m.sender != ?
-      AND (m.read_by IS NULL OR JSON_SEARCH(m.read_by, 'one', ?) IS NULL)
-      AND m.is_deleted = 0
-      AND (m.deleted_for IS NULL OR JSON_SEARCH(m.deleted_for, 'one', ?) IS NULL)
-    `;
-    
-    const params = [JSON.stringify(userId), userId, userId, userId];
-    
-    if (chatId) {
-      sql += ` AND m.chat = ?`;
-      params.push(chatId);
+    try {
+      let filter = {
+        sender: { $ne: userId },
+        'read_by': { $ne: userId },
+        is_deleted: { $ne: 1 }
+      };
+
+      if (chatId) {
+        filter.chat = chatId;
+      } else {
+        // Get all chats where user is participant
+        const userChats = await this.getAll('chats', {
+          participants: userId,
+          archived: { $ne: 1 }
+        });
+        filter.chat = { $in: userChats.map(c => c.name) };
+      }
+
+      const count = await this.db.collection('messages').countDocuments(filter);
+      return count;
+    } catch (error) {
+      console.error('Error getting unread message count:', error);
+      return 0;
     }
-    
-    const result = await this.query(sql, params);
-    return result[0].count;
   }
 
-  async getRecentContacts(userId, limit = 20) {
-    const sql = `
-      SELECT DISTINCT u.name, u.full_name, u.email, u.avatar_url, 
-             MAX(m.sent_at) as last_message_time
-      FROM \`tabUser\` u
-      JOIN \`tabERP Chat Message\` m ON (m.sender = u.name OR m.sender = ?)
-      JOIN \`tabERP Chat\` c ON m.chat = c.name
-      WHERE JSON_CONTAINS(c.participants, ?)
-      AND u.name != ?
-      AND u.enabled = 1
-      GROUP BY u.name, u.full_name, u.email, u.avatar_url
-      ORDER BY last_message_time DESC
-      LIMIT ?
-    `;
-    
-    return await this.query(sql, [userId, JSON.stringify(userId), userId, limit]);
+  async searchChats(userId, query, limit = 20) {
+    try {
+      const chats = await this.getAll('chats', {
+        participants: userId,
+        archived: { $ne: 1 },
+        $or: [
+          { chat_name: { $regex: query, $options: 'i' } },
+          { description: { $regex: query, $options: 'i' } }
+        ]
+      }, { limit });
+
+      return chats;
+    } catch (error) {
+      console.error('Error searching chats:', error);
+      return [];
+    }
+  }
+
+  async searchMessages(userId, query, chatId = null, limit = 50) {
+    try {
+      let filter = {
+        message: { $regex: query, $options: 'i' },
+        is_deleted: { $ne: 1 }
+      };
+
+      if (chatId) {
+        filter.chat = chatId;
+      }
+
+      const messages = await this.getAll('messages', filter, {
+        sort: { sent_at: -1 },
+        limit
+      });
+
+      return messages;
+    } catch (error) {
+      console.error('Error searching messages:', error);
+      return [];
+    }
   }
 
   // Analytics methods
   async getChatAnalytics(chatId, days = 30) {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - days);
-    
-    const sql = `
-      SELECT 
-        DATE(sent_at) as date,
-        COUNT(*) as message_count,
-        COUNT(DISTINCT sender) as active_users,
-        AVG(CHAR_LENGTH(message)) as avg_message_length
-      FROM \`tabERP Chat Message\`
-      WHERE chat = ? 
-      AND sent_at >= ?
-      AND is_deleted = 0
-      GROUP BY DATE(sent_at)
-      ORDER BY date DESC
-    `;
-    
-    return await this.query(sql, [chatId, cutoffDate.toISOString()]);
-  }
+    try {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - days);
 
-  async getUserChatStats(userId, days = 30) {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - days);
-    
-    const sql = `
-      SELECT 
-        COUNT(DISTINCT m.chat) as active_chats,
-        COUNT(*) as messages_sent,
-        AVG(CHAR_LENGTH(m.message)) as avg_message_length,
-        COUNT(DISTINCT DATE(m.sent_at)) as active_days
-      FROM \`tabERP Chat Message\` m
-      JOIN \`tabERP Chat\` c ON m.chat = c.name
-      WHERE m.sender = ?
-      AND m.sent_at >= ?
-      AND JSON_CONTAINS(c.participants, ?)
-      AND m.is_deleted = 0
-    `;
-    
-    const result = await this.query(sql, [userId, cutoffDate.toISOString(), JSON.stringify(userId)]);
-    return result[0] || {};
+      const pipeline = [
+        {
+          $match: {
+            chat: chatId,
+            sent_at: { $gte: cutoffDate },
+            is_deleted: { $ne: 1 }
+          }
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m-%d", date: "$sent_at" } },
+            message_count: { $sum: 1 },
+            active_users: { $addToSet: "$sender" },
+            avg_message_length: { $avg: { $strLenCP: "$message" } }
+          }
+        },
+        {
+          $project: {
+            date: "$_id",
+            message_count: 1,
+            active_users: { $size: "$active_users" },
+            avg_message_length: { $round: ["$avg_message_length", 2] }
+          }
+        },
+        { $sort: { date: -1 } }
+      ];
+
+      return await this.db.collection('messages').aggregate(pipeline).toArray();
+    } catch (error) {
+      console.error('Error getting chat analytics:', error);
+      return [];
+    }
   }
 
   // Database maintenance
   async cleanupOldMessages(days = 90) {
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - days);
-    
-    // Delete old messages (but keep last message in each chat)
-    const sql = `
-      DELETE m FROM \`tabERP Chat Message\` m
-      LEFT JOIN \`tabERP Chat\` c ON c.last_message = m.name
-      WHERE m.sent_at < ?
-      AND c.last_message IS NULL
-      AND m.is_pinned = 0
-    `;
-    
-    const result = await this.query(sql, [cutoffDate.toISOString()]);
-    return result.affectedRows;
-  }
+    try {
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - days);
 
-  async optimizeTables() {
-    const tables = ['ERP Chat', 'ERP Chat Message', 'ERP Chat Attachment', 'ERP Message Reaction'];
-    
-    for (const table of tables) {
-      try {
-        await this.query(`OPTIMIZE TABLE \`tab${table}\``);
-        console.log(`✅ [Chat Service] Optimized table ${table}`);
-      } catch (error) {
-        console.warn(`⚠️ [Chat Service] Failed to optimize table ${table}:`, error.message);
-      }
+      const result = await this.db.collection('messages').deleteMany({
+        sent_at: { $lt: cutoffDate },
+        is_pinned: { $ne: 1 }
+      });
+
+      console.log(`🧹 [Chat Service] Cleaned up ${result.deletedCount} old messages`);
+      return result.deletedCount;
+    } catch (error) {
+      console.error('Error cleaning up old messages:', error);
+      return 0;
     }
   }
 
@@ -342,13 +369,10 @@ class Database {
   async getStatus() {
     try {
       const status = {
-        connected: !!this.pool,
-        tables: await this.chatDb?.verifyTables() || {},
-        pool_status: this.pool ? {
-          total_connections: this.pool.pool._allConnections.length,
-          free_connections: this.pool.pool._freeConnections.length,
-          queue_length: this.pool.pool._connectionQueue.length
-        } : null
+        connected: this.isConnected,
+        database: process.env.MONGODB_DB_NAME,
+        collections: await this.db.listCollections().toArray(),
+        stats: await this.db.stats()
       };
 
       return status;
@@ -359,10 +383,10 @@ class Database {
   }
 
   async disconnect() {
-    if (this.pool) {
-      await this.pool.end();
-      this.pool = null;
-      console.log('📡 [Chat Service] Database disconnected');
+    if (this.client) {
+      await this.client.close();
+      this.isConnected = false;
+      console.log('📡 [Chat Service] MongoDB disconnected');
     }
   }
 }

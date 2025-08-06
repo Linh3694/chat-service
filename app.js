@@ -37,6 +37,9 @@ const io = new Server(server, {
   },
 });
 
+// Make io globally available for Redis pub/sub
+global.io = io;
+
 // Setup Redis adapter
 (async () => {
   try {
@@ -50,7 +53,7 @@ const io = new Server(server, {
   }
 })();
 
-// Connect to MariaDB
+// Connect to MongoDB
 const connectDB = async () => {
   try {
     await database.connect();
@@ -83,7 +86,10 @@ app.use((req, res, next) => {
 // Health check
 app.get('/health', async (req, res) => {
   try {
-    await database.query('SELECT 1');
+    // Test MongoDB connection
+    await database.db.admin().ping();
+    
+    // Test Redis connection
     await redisClient.client.ping();
     
     const onlineUsers = await redisClient.getOnlineUsersCount();
@@ -130,6 +136,13 @@ io.on('connection', (socket) => {
     socket.join(`user:${userId}`);
     redisClient.setUserOnline(userId, socket.id);
     
+    // Publish user online event to other services
+    redisClient.publishUserEvent('user_online', {
+      user_id: userId,
+      socket_id: socket.id,
+      timestamp: new Date().toISOString()
+    });
+    
     // Broadcast user online status
     socket.broadcast.emit('user_online', { 
       userId, 
@@ -150,10 +163,9 @@ io.on('connection', (socket) => {
       }
       
       // Verify user has access to this chat
-      const chat = await database.get('ERP Chat', chatId);
+      const chat = await database.get('chats', { name: chatId });
       if (chat) {
-        const participants = JSON.parse(chat.participants || '[]');
-        if (participants.includes(userId)) {
+        if (chat.participants.includes(userId)) {
           socket.join(`chat:${chatId}`);
           
           // Mark user as active in this chat
@@ -163,7 +175,7 @@ io.on('connection', (socket) => {
           socket.emit('chat_joined', {
             chatId,
             chatName: chatHelpers.generateChatDisplayName(chat, userId),
-            participantCount: participants.length,
+            participantCount: chat.participants.length,
             timestamp: new Date().toISOString()
           });
           
@@ -221,13 +233,12 @@ io.on('connection', (socket) => {
       }
       
       // Verify user has access to chat
-      const chat = await database.get('ERP Chat', chatId);
+      const chat = await database.get('chats', { name: chatId });
       if (!chat) {
         return socket.emit('error', { message: 'Chat not found' });
       }
       
-      const participants = JSON.parse(chat.participants || '[]');
-      if (!participants.includes(userId)) {
+      if (!chat.participants.includes(userId)) {
         return socket.emit('error', { message: 'No access to this chat' });
       }
       
@@ -245,31 +256,30 @@ io.on('connection', (socket) => {
         sender: userId,
         message: sanitizedMessage,
         message_type: messageType,
-        attachments: attachments ? JSON.stringify(attachments) : null,
+        attachments: attachments || null,
         reply_to: replyTo,
-        sent_at: new Date().toISOString(),
+        sent_at: new Date(),
         delivery_status: 'sent',
-        read_by: JSON.stringify([userId]),
-        creation: new Date().toISOString(),
-        modified: new Date().toISOString(),
-        owner: userId,
-        modified_by: userId
+        read_by: [userId],
+        is_deleted: 0,
+        is_edited: 0,
+        is_pinned: 0
       };
       
       // Save to database
-      await database.insert('ERP Chat Message', messageData);
+      await database.insert('messages', messageData);
       
       // Update chat last message
-      const messageCount = await database.query(
-        'SELECT COUNT(*) as count FROM `tabERP Chat Message` WHERE chat = ?', 
-        [chatId]
-      );
+      const messageCount = await database.db.collection('messages').countDocuments({
+        chat: chatId,
+        is_deleted: { $ne: 1 }
+      });
       
-      await database.update('ERP Chat', chatId, {
-        last_message: chatHelpers.getMessagePreview(messageData),
+      await database.update('chats', { name: chatId }, {
+        last_message: messageData.name,
         last_message_time: messageData.sent_at,
-        message_count: messageCount[0].count,
-        modified: new Date().toISOString()
+        message_count: messageCount,
+        updated_at: new Date()
       });
       
       // Cache the message
@@ -277,9 +287,19 @@ io.on('connection', (socket) => {
       
       // Invalidate relevant caches
       await redisClient.invalidateChatMessagesCache(chatId);
-      for (const participantId of participants) {
+      for (const participantId of chat.participants) {
         await redisClient.invalidateUserChatsCache(participantId);
       }
+      
+      // Publish message event to other services
+      await redisClient.publishChatEvent('message_sent', {
+        chat_id: chatId,
+        message_id: messageData.name,
+        sender_id: userId,
+        message_preview: sanitizedMessage?.substring(0, 100),
+        message_type: messageType,
+        timestamp: messageData.sent_at
+      });
       
       // Broadcast to chat room
       io.to(`chat:${chatId}`).emit('new_message', {
@@ -363,34 +383,32 @@ io.on('connection', (socket) => {
       if (messageIds.length > 0) {
         // Mark specific messages as read
         for (const messageId of messageIds) {
-          const message = await database.get('ERP Chat Message', messageId);
-          if (message) {
-            const readBy = JSON.parse(message.read_by || '[]');
-            if (!readBy.includes(userId)) {
-              readBy.push(userId);
-              await database.update('ERP Chat Message', messageId, {
-                read_by: JSON.stringify(readBy),
-                delivery_status: 'read',
-                modified: new Date().toISOString()
-              });
-              updatedCount++;
-            }
+          const message = await database.get('messages', { name: messageId });
+          if (message && !message.read_by.includes(userId)) {
+            message.read_by.push(userId);
+            await database.update('messages', { name: messageId }, {
+              read_by: message.read_by,
+              delivery_status: 'read',
+              updated_at: new Date()
+            });
+            updatedCount++;
           }
         }
       } else {
         // Mark all unread messages in chat as read
-        const unreadMessages = await database.query(`
-          SELECT name, read_by FROM \`tabERP Chat Message\`
-          WHERE chat = ? AND JSON_SEARCH(read_by, 'one', ?) IS NULL
-        `, [chatId, userId]);
+        const unreadMessages = await database.getAll('messages', {
+          chat: chatId,
+          sender: { $ne: userId },
+          read_by: { $ne: userId },
+          is_deleted: { $ne: 1 }
+        });
         
         for (const message of unreadMessages) {
-          const readBy = JSON.parse(message.read_by || '[]');
-          readBy.push(userId);
-          await database.update('ERP Chat Message', message.name, {
-            read_by: JSON.stringify(readBy),
+          message.read_by.push(userId);
+          await database.update('messages', { name: message.name }, {
+            read_by: message.read_by,
             delivery_status: 'read',
-            modified: new Date().toISOString()
+            updated_at: new Date()
           });
           updatedCount++;
         }
@@ -399,6 +417,14 @@ io.on('connection', (socket) => {
       if (updatedCount > 0) {
         // Invalidate cache
         await redisClient.invalidateChatMessagesCache(chatId);
+        
+        // Publish read event
+        await redisClient.publishChatEvent('messages_read', {
+          chat_id: chatId,
+          user_id: userId,
+          message_ids: messageIds.length > 0 ? messageIds : 'all',
+          count: updatedCount
+        });
         
         // Broadcast read receipts
         socket.to(`chat:${chatId}`).emit('messages_read', {
@@ -422,6 +448,12 @@ io.on('connection', (socket) => {
     
     if (userId) {
       await redisClient.setUserOffline(userId);
+      
+      // Publish user offline event to other services
+      redisClient.publishUserEvent('user_offline', {
+        user_id: userId,
+        timestamp: new Date().toISOString()
+      });
       
       // Clean up typing indicators
       const pattern = `typing:*:${userId}`;
@@ -457,12 +489,12 @@ cron.schedule('0 3 * * *', async () => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
     
-    await database.query(
-      'DELETE FROM `tabERP Chat Message` WHERE sent_at < ?',
-      [cutoffDate.toISOString()]
-    );
+    const result = await database.db.collection('messages').deleteMany({
+      sent_at: { $lt: cutoffDate },
+      is_pinned: { $ne: 1 }
+    });
     
-    console.log('✅ [Chat Service] Old messages cleaned up');
+    console.log(`✅ [Chat Service] Cleaned up ${result.deletedCount} old messages`);
   } catch (error) {
     console.error('❌ [Chat Service] Error cleaning up messages:', error);
   }

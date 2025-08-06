@@ -21,14 +21,11 @@ class ChatController {
 
       if (!chat) {
         // Search for existing direct chat (not group)
-        const existingChats = await database.query(`
-          SELECT * FROM \`tabERP Chat\`
-          WHERE JSON_CONTAINS(participants, ?) 
-          AND JSON_CONTAINS(participants, ?)
-          AND is_group = 0
-          AND archived = 0
-          LIMIT 1
-        `, [JSON.stringify(current_user_id), JSON.stringify(participant_id)]);
+        const existingChats = await database.getAll('chats', {
+          participants: { $all: [current_user_id, participant_id] },
+          is_group: 0,
+          archived: { $ne: 1 }
+        });
 
         if (existingChats.length > 0) {
           chat = existingChats[0];
@@ -36,23 +33,27 @@ class ChatController {
           // Create new direct chat
           const participants = [current_user_id, participant_id];
           const chatData = {
-            name: `CHAT-${Date.now()}`,
+            name: `CHAT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
             chat_name: null,
-            participants: JSON.stringify(participants),
+            participants: participants,
             chat_type: 'direct',
             is_group: 0,
             message_count: 0,
             creator: current_user_id,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            creation: new Date().toISOString(),
-            modified: new Date().toISOString(),
-            owner: current_user_id,
-            modified_by: current_user_id
+            archived: 0,
+            created_at: new Date(),
+            updated_at: new Date()
           };
 
-          await database.insert('ERP Chat', chatData);
+          await database.insert('chats', chatData);
           chat = chatData;
+
+          // Publish chat creation event
+          await redisClient.publishChatEvent('chat_created', {
+            chat_id: chat.name,
+            creator: current_user_id,
+            participants: participants
+          });
         }
 
         // Cache the chat
@@ -84,34 +85,36 @@ class ChatController {
       let chats = await redisClient.getUserChats(cacheKey);
 
       if (!chats) {
-        let sql = `
-          SELECT c.*, 
-                 cm.message as last_message_content,
-                 cm.sent_at as last_message_time,
-                 u.full_name as last_sender_name
-          FROM \`tabERP Chat\` c
-          LEFT JOIN \`tabERP Chat Message\` cm ON c.last_message = cm.name
-          LEFT JOIN \`tabUser\` u ON cm.sender = u.name
-          WHERE JSON_CONTAINS(c.participants, ?) 
-          AND c.archived = 0
-        `;
-        const params = [JSON.stringify(user_id)];
+        let filter = {
+          participants: user_id,
+          archived: { $ne: 1 }
+        };
 
         if (search) {
-          sql += ` AND (c.chat_name LIKE ? OR cm.message LIKE ?)`;
-          params.push(`%${search}%`, `%${search}%`);
+          filter.$or = [
+            { chat_name: { $regex: search, $options: 'i' } },
+            { description: { $regex: search, $options: 'i' } }
+          ];
         }
 
-        sql += ` ORDER BY c.updated_at DESC LIMIT ?`;
-        params.push(parseInt(limit));
+        chats = await database.getAll('chats', filter, {
+          sort: { updated_at: -1 },
+          limit: parseInt(limit)
+        });
 
-        chats = await database.query(sql, params);
+        // Get last message for each chat
+        for (let chat of chats) {
+          const lastMessage = await database.get('messages', {
+            chat: chat.name,
+            is_deleted: { $ne: 1 }
+          }, { sort: { sent_at: -1 } });
 
-        // Parse participants for each chat
-        chats = chats.map(chat => ({
-          ...chat,
-          participants: JSON.parse(chat.participants || '[]')
-        }));
+          if (lastMessage) {
+            chat.last_message_content = lastMessage.message;
+            chat.last_message_time = lastMessage.sent_at;
+            chat.last_sender_name = lastMessage.sender;
+          }
+        }
 
         // Cache the results
         await redisClient.setUserChats(cacheKey, chats);
@@ -166,13 +169,12 @@ class ChatController {
       }
 
       // Check if chat exists and user has permission
-      const chat = await database.get('ERP Chat', chat_id);
+      const chat = await database.get('chats', { name: chat_id });
       if (!chat) {
         return res.status(404).json({ error: 'Chat not found' });
       }
 
-      const participants = JSON.parse(chat.participants || '[]');
-      if (!participants.includes(sender_id)) {
+      if (!chat.participants.includes(sender_id)) {
         return res.status(403).json({
           error: 'No permission to send message to this chat'
         });
@@ -199,30 +201,28 @@ class ChatController {
         emoji_name,
         emoji_url,
         reply_to,
-        attachments: attachments ? JSON.stringify(attachments) : null,
-        sent_at: new Date().toISOString(),
+        attachments: attachments || null,
+        sent_at: new Date(),
         delivery_status: 'sent',
-        read_by: JSON.stringify([sender_id]),
-        creation: new Date().toISOString(),
-        modified: new Date().toISOString(),
-        owner: sender_id,
-        modified_by: sender_id
+        read_by: [sender_id],
+        is_deleted: 0,
+        is_edited: 0,
+        is_pinned: 0
       };
 
-      await database.insert('ERP Chat Message', messageData);
+      await database.insert('messages', messageData);
 
       // Update chat's last message
-      const messageCount = await database.query(
-        'SELECT COUNT(*) as count FROM `tabERP Chat Message` WHERE chat = ?',
-        [chat_id]
-      );
+      const messageCount = await database.db.collection('messages').countDocuments({
+        chat: chat_id,
+        is_deleted: { $ne: 1 }
+      });
 
-      await database.update('ERP Chat', chat_id, {
+      await database.update('chats', { name: chat_id }, {
         last_message: messageData.name,
         last_message_time: messageData.sent_at,
-        message_count: messageCount[0].count,
-        updated_at: new Date().toISOString(),
-        modified: new Date().toISOString()
+        message_count: messageCount,
+        updated_at: new Date()
       });
 
       // Cache message if temp_id provided
@@ -231,10 +231,20 @@ class ChatController {
       }
 
       // Invalidate related caches
-      await redisClient.invalidateChatCaches(chat_id, participants);
-      for (const participantId of participants) {
+      await redisClient.invalidateChatCaches(chat_id, chat.participants);
+      for (const participantId of chat.participants) {
         await redisClient.invalidateUserChatsCache(participantId);
       }
+
+      // Publish message event to other services
+      await redisClient.publishChatEvent('message_sent', {
+        chat_id,
+        message_id: messageData.name,
+        sender_id,
+        message_preview: content?.substring(0, 100),
+        message_type,
+        timestamp: messageData.sent_at
+      });
 
       // Emit real-time message
       const io = req.app?.get('io');
@@ -246,7 +256,7 @@ class ChatController {
         });
 
         // Send chat update to participants
-        participants.forEach(participantId => {
+        chat.participants.forEach(participantId => {
           if (participantId !== sender_id) {
             io.to(`user:${participantId}`).emit('chat_updated', {
               chat_id,
@@ -284,44 +294,45 @@ class ChatController {
       let messages = await redisClient.getChatMessages(cacheKey);
 
       if (!messages) {
-        let sql = `
-          SELECT m.*, 
-                 u.full_name as sender_name,
-                 u.avatar_url as sender_avatar,
-                 rm.message as reply_message,
-                 ru.full_name as reply_sender_name
-          FROM \`tabERP Chat Message\` m
-          LEFT JOIN \`tabUser\` u ON m.sender = u.name
-          LEFT JOIN \`tabERP Chat Message\` rm ON m.reply_to = rm.name
-          LEFT JOIN \`tabUser\` ru ON rm.sender = ru.name
-          WHERE m.chat = ?
-        `;
-        const params = [chat_id];
+        let filter = {
+          chat: chat_id,
+          is_deleted: { $ne: 1 }
+        };
 
         if (before_message) {
-          const beforeMsg = await database.get('ERP Chat Message', before_message);
+          const beforeMsg = await database.get('messages', { name: before_message });
           if (beforeMsg) {
-            sql += ` AND m.sent_at < ?`;
-            params.push(beforeMsg.sent_at);
+            filter.sent_at = { $lt: beforeMsg.sent_at };
           }
         }
 
         if (search) {
-          sql += ` AND m.message LIKE ?`;
-          params.push(`%${search}%`);
+          filter.message = { $regex: search, $options: 'i' };
         }
 
-        sql += ` ORDER BY m.sent_at DESC LIMIT ?`;
-        params.push(parseInt(limit));
+        messages = await database.getAll('messages', filter, {
+          sort: { sent_at: -1 },
+          limit: parseInt(limit)
+        });
 
-        messages = await database.query(sql, params);
+        // Get sender information for each message
+        for (let msg of messages) {
+          const sender = await database.get('users', { name: msg.sender });
+          if (sender) {
+            msg.sender_name = sender.full_name;
+            msg.sender_avatar = sender.avatar_url;
+          }
 
-        // Parse JSON fields
-        messages = messages.map(msg => ({
-          ...msg,
-          read_by: JSON.parse(msg.read_by || '[]'),
-          attachments: msg.attachments ? JSON.parse(msg.attachments) : null
-        }));
+          // Get reply message info if exists
+          if (msg.reply_to) {
+            const replyMsg = await database.get('messages', { name: msg.reply_to });
+            if (replyMsg) {
+              msg.reply_message = replyMsg.message;
+              const replySender = await database.get('users', { name: replyMsg.sender });
+              msg.reply_sender_name = replySender?.full_name;
+            }
+          }
+        }
 
         // Cache the results
         await redisClient.setChatMessages(cacheKey, messages);
@@ -358,34 +369,32 @@ class ChatController {
       if (message_ids.length > 0) {
         // Mark specific messages as read
         for (const messageId of message_ids) {
-          const message = await database.get('ERP Chat Message', messageId);
-          if (message) {
-            const readBy = JSON.parse(message.read_by || '[]');
-            if (!readBy.includes(userId)) {
-              readBy.push(userId);
-              await database.update('ERP Chat Message', messageId, {
-                read_by: JSON.stringify(readBy),
-                delivery_status: 'read',
-                modified: new Date().toISOString()
-              });
-              updatedCount++;
-            }
+          const message = await database.get('messages', { name: messageId });
+          if (message && !message.read_by.includes(userId)) {
+            message.read_by.push(userId);
+            await database.update('messages', { name: messageId }, {
+              read_by: message.read_by,
+              delivery_status: 'read',
+              updated_at: new Date()
+            });
+            updatedCount++;
           }
         }
       } else {
         // Mark all unread messages in chat as read
-        const unreadMessages = await database.query(`
-          SELECT name, read_by FROM \`tabERP Chat Message\`
-          WHERE chat = ? AND JSON_SEARCH(read_by, 'one', ?) IS NULL
-        `, [chat_id, userId]);
+        const unreadMessages = await database.getAll('messages', {
+          chat: chat_id,
+          sender: { $ne: userId },
+          read_by: { $ne: userId },
+          is_deleted: { $ne: 1 }
+        });
 
         for (const message of unreadMessages) {
-          const readBy = JSON.parse(message.read_by || '[]');
-          readBy.push(userId);
-          await database.update('ERP Chat Message', message.name, {
-            read_by: JSON.stringify(readBy),
+          message.read_by.push(userId);
+          await database.update('messages', { name: message.name }, {
+            read_by: message.read_by,
             delivery_status: 'read',
-            modified: new Date().toISOString()
+            updated_at: new Date()
           });
           updatedCount++;
         }
@@ -393,6 +402,14 @@ class ChatController {
 
       // Invalidate caches
       await redisClient.invalidateChatMessagesCache(chat_id);
+
+      // Publish read event
+      await redisClient.publishChatEvent('messages_read', {
+        chat_id,
+        user_id: userId,
+        message_ids: message_ids.length > 0 ? message_ids : 'all',
+        count: updatedCount
+      });
 
       // Emit read receipt
       const io = req.app?.get('io');
@@ -427,7 +444,7 @@ class ChatController {
       const sender_id = req.user?.id || req.body.sender_id;
 
       // Check if original message exists
-      const originalMessage = await database.get('ERP Chat Message', reply_to_id);
+      const originalMessage = await database.get('messages', { name: reply_to_id });
       if (!originalMessage) {
         return res.status(404).json({ error: 'Original message not found' });
       }
@@ -456,7 +473,7 @@ class ChatController {
       const sender_id = req.user?.id || req.body.sender_id;
 
       // Get original message
-      const originalMessage = await database.get('ERP Chat Message', message_id);
+      const originalMessage = await database.get('messages', { name: message_id });
       if (!originalMessage) {
         return res.status(404).json({ error: 'Original message not found' });
       }
@@ -472,22 +489,28 @@ class ChatController {
         original_message: message_id,
         original_sender: originalMessage.sender,
         attachments: originalMessage.attachments,
-        sent_at: new Date().toISOString(),
+        sent_at: new Date(),
         delivery_status: 'sent',
-        read_by: JSON.stringify([sender_id]),
-        creation: new Date().toISOString(),
-        modified: new Date().toISOString(),
-        owner: sender_id,
-        modified_by: sender_id
+        read_by: [sender_id],
+        is_deleted: 0
       };
 
-      await database.insert('ERP Chat Message', messageData);
+      await database.insert('messages', messageData);
 
       // Update target chat
-      await database.update('ERP Chat', to_chat_id, {
+      await database.update('chats', { name: to_chat_id }, {
         last_message: messageData.name,
         last_message_time: messageData.sent_at,
-        updated_at: new Date().toISOString()
+        updated_at: new Date()
+      });
+
+      // Publish forward event
+      await redisClient.publishChatEvent('message_forwarded', {
+        original_message_id: message_id,
+        new_message_id: messageData.name,
+        from_chat_id: originalMessage.chat,
+        to_chat_id,
+        sender_id
       });
 
       // Emit real-time update
@@ -517,7 +540,7 @@ class ChatController {
       const { for_everyone = false } = req.body;
       const user_id = req.user?.id || req.body.user_id;
 
-      const message = await database.get('ERP Chat Message', message_id);
+      const message = await database.get('messages', { name: message_id });
       if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
@@ -528,26 +551,34 @@ class ChatController {
 
       if (for_everyone) {
         // Delete for everyone
-        await database.update('ERP Chat Message', message_id, {
+        await database.update('messages', { name: message_id }, {
           message: 'This message was deleted',
           is_deleted: 1,
-          deleted_at: new Date().toISOString(),
-          modified: new Date().toISOString()
+          deleted_at: new Date(),
+          updated_at: new Date()
         });
       } else {
         // Delete for self only - add to deleted_for array
-        const deletedFor = JSON.parse(message.deleted_for || '[]');
-        if (!deletedFor.includes(user_id)) {
-          deletedFor.push(user_id);
-          await database.update('ERP Chat Message', message_id, {
-            deleted_for: JSON.stringify(deletedFor),
-            modified: new Date().toISOString()
+        if (!message.deleted_for) message.deleted_for = [];
+        if (!message.deleted_for.includes(user_id)) {
+          message.deleted_for.push(user_id);
+          await database.update('messages', { name: message_id }, {
+            deleted_for: message.deleted_for,
+            updated_at: new Date()
           });
         }
       }
 
       // Invalidate caches
       await redisClient.invalidateChatMessagesCache(message.chat);
+
+      // Publish delete event
+      await redisClient.publishChatEvent('message_deleted', {
+        message_id,
+        chat_id: message.chat,
+        deleted_by: user_id,
+        for_everyone
+      });
 
       // Emit real-time update
       const io = req.app?.get('io');
@@ -585,32 +616,40 @@ class ChatController {
         });
       }
 
-      let sql = `
-        SELECT m.*, c.chat_name, u.full_name as sender_name
-        FROM \`tabERP Chat Message\` m
-        JOIN \`tabERP Chat\` c ON m.chat = c.name
-        JOIN \`tabUser\` u ON m.sender = u.name
-        WHERE m.message LIKE ?
-        AND JSON_CONTAINS(c.participants, ?)
-        AND (m.deleted_for IS NULL OR JSON_SEARCH(m.deleted_for, 'one', ?) IS NULL)
-      `;
-
-      const params = [`%${query}%`, JSON.stringify(user_id), user_id];
+      let filter = {
+        message: { $regex: query, $options: 'i' },
+        is_deleted: { $ne: 1 }
+      };
 
       if (chat_id) {
-        sql += ` AND m.chat = ?`;
-        params.push(chat_id);
+        filter.chat = chat_id;
+      } else {
+        // Get all chats where user is participant
+        const userChats = await database.getAll('chats', {
+          participants: user_id,
+          archived: { $ne: 1 }
+        });
+        filter.chat = { $in: userChats.map(c => c.name) };
       }
 
-      sql += ` ORDER BY m.sent_at DESC LIMIT ?`;
-      params.push(parseInt(limit));
+      const messages = await database.getAll('messages', filter, {
+        sort: { sent_at: -1 },
+        limit: parseInt(limit)
+      });
 
-      const results = await database.query(sql, params);
+      // Get additional info for each message
+      for (let msg of messages) {
+        const chat = await database.get('chats', { name: msg.chat });
+        const sender = await database.get('users', { name: msg.sender });
+        
+        msg.chat_name = chat?.chat_name;
+        msg.sender_name = sender?.full_name;
+      }
 
       res.json({
-        message: results,
+        message: messages,
         status: 'success',
-        total: results.length,
+        total: messages.length,
         query
       });
 

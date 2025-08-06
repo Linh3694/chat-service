@@ -10,47 +10,48 @@ class MessageController {
       const { message_id } = req.params;
       const user_id = req.user?.id || req.query.user_id;
 
-      const message = await database.query(`
-        SELECT m.*, 
-               u.full_name as sender_name,
-               u.avatar_url as sender_avatar,
-               c.chat_name,
-               rm.message as reply_message,
-               ru.full_name as reply_sender_name
-        FROM \`tabERP Chat Message\` m
-        LEFT JOIN \`tabUser\` u ON m.sender = u.name
-        LEFT JOIN \`tabERP Chat\` c ON m.chat = c.name
-        LEFT JOIN \`tabERP Chat Message\` rm ON m.reply_to = rm.name
-        LEFT JOIN \`tabUser\` ru ON rm.sender = ru.name
-        WHERE m.name = ?
-      `, [message_id]);
-
-      if (!message || message.length === 0) {
+      const message = await database.get('messages', { name: message_id });
+      if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
 
-      const msg = message[0];
-
       // Check if user has access to this message
-      const chat = await database.get('ERP Chat', msg.chat);
-      const participants = JSON.parse(chat.participants || '[]');
-      
-      if (!participants.includes(user_id)) {
+      const chat = await database.get('chats', { name: message.chat });
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this message' });
       }
 
       // Check if message is deleted for this user
-      const deletedFor = JSON.parse(msg.deleted_for || '[]');
-      if (deletedFor.includes(user_id)) {
+      if (message.deleted_for && message.deleted_for.includes(user_id)) {
         return res.status(404).json({ error: 'Message not found' });
       }
 
-      // Parse JSON fields
-      msg.read_by = JSON.parse(msg.read_by || '[]');
-      msg.attachments = msg.attachments ? JSON.parse(msg.attachments) : null;
+      // Get sender information
+      const sender = await database.get('users', { name: message.sender });
+      if (sender) {
+        message.sender_name = sender.full_name;
+        message.sender_avatar = sender.avatar_url;
+      }
+
+      // Get chat information
+      message.chat_name = chat.chat_name;
+
+      // Get reply message info if exists
+      if (message.reply_to) {
+        const replyMsg = await database.get('messages', { name: message.reply_to });
+        if (replyMsg) {
+          message.reply_message = replyMsg.message;
+          const replySender = await database.get('users', { name: replyMsg.sender });
+          message.reply_sender_name = replySender?.full_name;
+        }
+      }
 
       res.json({
-        message: msg,
+        message: message,
         status: 'success'
       });
 
@@ -74,13 +75,12 @@ class MessageController {
       const user_id = req.user?.id || req.body.user_id;
 
       // Verify user has access to chat
-      const chat = await database.get('ERP Chat', chat_id);
+      const chat = await database.get('chats', { name: chat_id });
       if (!chat) {
         return res.status(404).json({ error: 'Chat not found' });
       }
 
-      const participants = JSON.parse(chat.participants || '[]');
-      if (!participants.includes(user_id)) {
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this chat' });
       }
 
@@ -93,13 +93,11 @@ class MessageController {
         mime_type: file.mimetype,
         chat: chat_id,
         uploaded_by: user_id,
-        creation: new Date().toISOString(),
-        modified: new Date().toISOString(),
-        owner: user_id,
-        modified_by: user_id
+        created_at: new Date(),
+        updated_at: new Date()
       };
 
-      await database.insert('ERP Chat Attachment', fileData);
+      await database.insert('attachments', fileData);
 
       res.json({
         message: {
@@ -127,16 +125,18 @@ class MessageController {
       const { attachment_id } = req.params;
       const user_id = req.user?.id || req.query.user_id;
 
-      const attachment = await database.get('ERP Chat Attachment', attachment_id);
+      const attachment = await database.get('attachments', { name: attachment_id });
       if (!attachment) {
         return res.status(404).json({ error: 'Attachment not found' });
       }
 
       // Verify user has access to the chat
-      const chat = await database.get('ERP Chat', attachment.chat);
-      const participants = JSON.parse(chat.participants || '[]');
-      
-      if (!participants.includes(user_id)) {
+      const chat = await database.get('chats', { name: attachment.chat });
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this attachment' });
       }
 
@@ -161,13 +161,18 @@ class MessageController {
     try {
       const { message_id } = req.params;
 
-      const reactions = await database.query(`
-        SELECT r.*, u.full_name, u.avatar_url
-        FROM \`tabERP Message Reaction\` r
-        LEFT JOIN \`tabUser\` u ON r.user = u.name
-        WHERE r.message = ?
-        ORDER BY r.creation ASC
-      `, [message_id]);
+      const reactions = await database.getAll('reactions', { message: message_id }, {
+        sort: { created_at: 1 }
+      });
+
+      // Get user information for each reaction
+      for (let reaction of reactions) {
+        const user = await database.get('users', { name: reaction.user });
+        if (user) {
+          reaction.full_name = user.full_name;
+          reaction.avatar_url = user.avatar_url;
+        }
+      }
 
       // Group by emoji
       const grouped = {};
@@ -213,27 +218,30 @@ class MessageController {
       }
 
       // Check if message exists and user has access
-      const message = await database.get('ERP Chat Message', message_id);
+      const message = await database.get('messages', { name: message_id });
       if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
 
-      const chat = await database.get('ERP Chat', message.chat);
-      const participants = JSON.parse(chat.participants || '[]');
-      
-      if (!participants.includes(user_id)) {
+      const chat = await database.get('chats', { name: message.chat });
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this message' });
       }
 
       // Check if user already reacted with this emoji
-      const existing = await database.query(
-        'SELECT name FROM `tabERP Message Reaction` WHERE message = ? AND user = ? AND emoji = ?',
-        [message_id, user_id, emoji]
-      );
+      const existing = await database.get('reactions', {
+        message: message_id,
+        user: user_id,
+        emoji: emoji
+      });
 
-      if (existing.length > 0) {
+      if (existing) {
         // Remove existing reaction
-        await database.delete('ERP Message Reaction', existing[0].name);
+        await database.delete('reactions', { name: existing.name });
         
         res.json({
           message: 'Reaction removed',
@@ -247,13 +255,11 @@ class MessageController {
           message: message_id,
           user: user_id,
           emoji: emoji,
-          creation: new Date().toISOString(),
-          modified: new Date().toISOString(),
-          owner: user_id,
-          modified_by: user_id
+          created_at: new Date(),
+          updated_at: new Date()
         };
 
-        await database.insert('ERP Message Reaction', reactionData);
+        await database.insert('reactions', reactionData);
 
         res.json({
           message: 'Reaction added',
@@ -262,6 +268,15 @@ class MessageController {
         });
       }
 
+      // Publish reaction event
+      await redisClient.publishChatEvent('message_reaction', {
+        message_id,
+        user_id,
+        emoji,
+        action: existing ? 'removed' : 'added',
+        chat_id: message.chat
+      });
+
       // Emit real-time update
       const io = req.app?.get('io');
       if (io) {
@@ -269,7 +284,7 @@ class MessageController {
           message_id,
           user_id,
           emoji,
-          action: existing.length > 0 ? 'removed' : 'added',
+          action: existing ? 'removed' : 'added',
           timestamp: new Date().toISOString()
         });
       }
@@ -289,16 +304,18 @@ class MessageController {
       const { message_id } = req.params;
       const user_id = req.user?.id || req.body.user_id;
 
-      const message = await database.get('ERP Chat Message', message_id);
+      const message = await database.get('messages', { name: message_id });
       if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
 
       // Verify user has access and is admin of group (for group chats)
-      const chat = await database.get('ERP Chat', message.chat);
-      const participants = JSON.parse(chat.participants || '[]');
-      
-      if (!participants.includes(user_id)) {
+      const chat = await database.get('chats', { name: message.chat });
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this message' });
       }
 
@@ -308,11 +325,19 @@ class MessageController {
       }
 
       const isPinned = message.is_pinned ? 0 : 1;
-      await database.update('ERP Chat Message', message_id, {
+      await database.update('messages', { name: message_id }, {
         is_pinned: isPinned,
         pinned_by: isPinned ? user_id : null,
-        pinned_at: isPinned ? new Date().toISOString() : null,
-        modified: new Date().toISOString()
+        pinned_at: isPinned ? new Date() : null,
+        updated_at: new Date()
+      });
+
+      // Publish pin event
+      await redisClient.publishChatEvent('message_pinned', {
+        message_id,
+        chat_id: message.chat,
+        is_pinned: isPinned,
+        pinned_by: user_id
       });
 
       // Emit real-time update
@@ -348,39 +373,41 @@ class MessageController {
       const user_id = req.user?.id || req.query.user_id;
 
       // Verify access to chat
-      const chat = await database.get('ERP Chat', chat_id);
+      const chat = await database.get('chats', { name: chat_id });
       if (!chat) {
         return res.status(404).json({ error: 'Chat not found' });
       }
 
-      const participants = JSON.parse(chat.participants || '[]');
-      if (!participants.includes(user_id)) {
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this chat' });
       }
 
-      const pinnedMessages = await database.query(`
-        SELECT m.*, 
-               u.full_name as sender_name,
-               u.avatar_url as sender_avatar,
-               pu.full_name as pinned_by_name
-        FROM \`tabERP Chat Message\` m
-        LEFT JOIN \`tabUser\` u ON m.sender = u.name
-        LEFT JOIN \`tabUser\` pu ON m.pinned_by = pu.name
-        WHERE m.chat = ? AND m.is_pinned = 1
-        ORDER BY m.pinned_at DESC
-      `, [chat_id]);
+      const pinnedMessages = await database.getAll('messages', {
+        chat: chat_id,
+        is_pinned: 1
+      }, {
+        sort: { pinned_at: -1 }
+      });
 
-      // Parse JSON fields
-      const messages = pinnedMessages.map(msg => ({
-        ...msg,
-        read_by: JSON.parse(msg.read_by || '[]'),
-        attachments: msg.attachments ? JSON.parse(msg.attachments) : null
-      }));
+      // Get additional information for each message
+      for (let msg of pinnedMessages) {
+        const sender = await database.get('users', { name: msg.sender });
+        const pinnedBy = await database.get('users', { name: msg.pinned_by });
+        
+        if (sender) {
+          msg.sender_name = sender.full_name;
+          msg.sender_avatar = sender.avatar_url;
+        }
+        
+        if (pinnedBy) {
+          msg.pinned_by_name = pinnedBy.full_name;
+        }
+      }
 
       res.json({
-        message: messages,
+        message: pinnedMessages,
         status: 'success',
-        total: messages.length
+        total: pinnedMessages.length
       });
 
     } catch (error) {
@@ -398,26 +425,32 @@ class MessageController {
       const { message_id } = req.params;
       const user_id = req.user?.id || req.query.user_id;
 
-      const message = await database.get('ERP Chat Message', message_id);
+      const message = await database.get('messages', { name: message_id });
       if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
 
       // Verify access
-      const chat = await database.get('ERP Chat', message.chat);
-      const participants = JSON.parse(chat.participants || '[]');
-      
-      if (!participants.includes(user_id)) {
+      const chat = await database.get('chats', { name: message.chat });
+      if (!chat) {
+        return res.status(404).json({ error: 'Chat not found' });
+      }
+
+      if (!chat.participants.includes(user_id)) {
         return res.status(403).json({ error: 'No access to this message' });
       }
 
-      const history = await database.query(`
-        SELECT h.*, u.full_name as edited_by_name
-        FROM \`tabERP Message History\` h
-        LEFT JOIN \`tabUser\` u ON h.edited_by = u.name
-        WHERE h.message = ?
-        ORDER BY h.creation ASC
-      `, [message_id]);
+      const history = await database.getAll('message_history', { message: message_id }, {
+        sort: { created_at: 1 }
+      });
+
+      // Get editor information for each history entry
+      for (let entry of history) {
+        const editor = await database.get('users', { name: entry.edited_by });
+        if (editor) {
+          entry.edited_by_name = editor.full_name;
+        }
+      }
 
       res.json({
         message: history,
@@ -445,7 +478,7 @@ class MessageController {
         return res.status(400).json({ error: 'Content cannot be empty' });
       }
 
-      const message = await database.get('ERP Chat Message', message_id);
+      const message = await database.get('messages', { name: message_id });
       if (!message) {
         return res.status(404).json({ error: 'Message not found' });
       }
@@ -470,25 +503,31 @@ class MessageController {
         message: message_id,
         original_content: message.message,
         edited_by: user_id,
-        edited_at: new Date().toISOString(),
-        creation: new Date().toISOString(),
-        modified: new Date().toISOString(),
-        owner: user_id,
-        modified_by: user_id
+        edited_at: new Date(),
+        created_at: new Date(),
+        updated_at: new Date()
       };
 
-      await database.insert('ERP Message History', historyData);
+      await database.insert('message_history', historyData);
 
       // Update message
-      await database.update('ERP Chat Message', message_id, {
+      await database.update('messages', { name: message_id }, {
         message: content.trim(),
         is_edited: 1,
-        edited_at: new Date().toISOString(),
-        modified: new Date().toISOString()
+        edited_at: new Date(),
+        updated_at: new Date()
       });
 
       // Invalidate caches
       await redisClient.invalidateChatMessagesCache(message.chat);
+
+      // Publish edit event
+      await redisClient.publishChatEvent('message_edited', {
+        message_id,
+        chat_id: message.chat,
+        edited_by: user_id,
+        new_content: content.trim()
+      });
 
       // Emit real-time update
       const io = req.app?.get('io');
