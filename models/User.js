@@ -5,9 +5,7 @@ const userSchema = new mongoose.Schema({
   // ID từ Frappe hoặc backend chính
   frappeUserId: {
     type: String,
-    required: true,
-    unique: true,
-    index: true
+    required: true
   },
   
   // Thông tin cơ bản
@@ -25,8 +23,7 @@ const userSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true,
-    lowercase: true,
-    index: true
+    lowercase: true
   },
   
   // Thông tin hiển thị

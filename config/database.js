@@ -19,7 +19,6 @@ class Database {
         serverSelectionTimeoutMS: 5000,
         socketTimeoutMS: 45000,
         // Tối ưu cho local development
-        bufferMaxEntries: 0,
         connectTimeoutMS: 10000,
       };
 
