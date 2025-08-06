@@ -22,18 +22,43 @@ if (!fs.existsSync(uploadPath)) {
   fs.mkdirSync(uploadPath, { recursive: true });
 }
 
-// Socket.IO setup with authentication
+// Socket.IO setup with enhanced Frappe authentication
 const io = new Server(server, {
   cors: { origin: "*" },
-  allowRequest: (req, callback) => {
+  allowRequest: async (req, callback) => {
     const token = req._query?.token;
     if (!token) return callback("unauthorized", false);
     
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-      if (err) return callback("unauthorized", false);
-      req.user = decoded;
-      callback(null, true);
-    });
+    try {
+      // Validate token with Frappe service
+      const frappeUser = await frappeService.authenticateUser(token);
+      
+      if (frappeUser) {
+        // Tạo hoặc cập nhật user trong local database
+        const localUser = await User.updateFromFrappe(frappeUser);
+        
+        req.user = {
+          _id: localUser._id,
+          id: localUser._id,
+          frappeUserId: localUser.frappeUserId,
+          fullname: localUser.fullName,
+          full_name: localUser.fullName,
+          name: localUser.name,
+          email: localUser.email,
+          role: localUser.role,
+          roles: localUser.roles,
+          avatar: localUser.avatar
+        };
+        
+        console.log(`🔐 [Chat Service] User authenticated: ${localUser.fullName} (${localUser.email})`);
+        callback(null, true);
+      } else {
+        callback("invalid_token", false);
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Socket authentication error:', error.message);
+      callback("authentication_failed", false);
+    }
   },
 });
 
@@ -83,33 +108,83 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
+// Import models
+const Chat = require('./models/Chat');
+const Message = require('./models/Message');
+const User = require('./models/User');
+
+// Import services
+const frappeService = require('./services/frappeService');
+const ticketService = require('./services/ticketService');
+const notificationService = require('./services/notificationService');
+
+// Health check với kiểm tra tất cả services
 app.get('/health', async (req, res) => {
   try {
-    // Test MongoDB connection
-    await database.db.admin().ping();
-    
-    // Test Redis connection
-    await redisClient.client.ping();
-    
-    const onlineUsers = await redisClient.getOnlineUsersCount();
-    const activeChats = await redisClient.getActiveChatsCount();
-    
-    res.status(200).json({ 
-      status: 'ok', 
+    const healthStatus = {
+      status: 'ok',
       service: 'chat-service',
       version: '1.0.0',
-      timestamp: new Date().toISOString(),
-      database: 'connected',
-      redis: 'connected',
-      online_users: onlineUsers,
-      active_chats: activeChats
-    });
+      timestamp: new Date().toISOString()
+    };
+
+    // Kiểm tra database
+    try {
+      await database.healthCheck();
+      healthStatus.database = 'connected';
+    } catch (error) {
+      healthStatus.database = 'error';
+      healthStatus.database_error = error.message;
+    }
+
+    // Kiểm tra Redis
+    try {
+      await redisClient.client.ping();
+      healthStatus.redis = 'connected';
+    } catch (error) {
+      healthStatus.redis = 'error';
+      healthStatus.redis_error = error.message;
+    }
+
+    // Kiểm tra Frappe service
+    const frappeHealth = await frappeService.healthCheck();
+    healthStatus.frappe = frappeHealth.status;
+    if (frappeHealth.status === 'error') {
+      healthStatus.frappe_error = frappeHealth.message;
+    }
+
+    // Kiểm tra Ticket service
+    const ticketHealth = await ticketService.healthCheck();
+    healthStatus.ticket_service = ticketHealth.status;
+    if (ticketHealth.status === 'error') {
+      healthStatus.ticket_error = ticketHealth.message;
+    }
+
+    // Kiểm tra Notification service
+    const notificationHealth = await notificationService.healthCheck();
+    healthStatus.notification_service = notificationHealth.status;
+    if (notificationHealth.status === 'error') {
+      healthStatus.notification_error = notificationHealth.message;
+    }
+
+    // Xác định status tổng thể
+    const criticalServices = ['database', 'redis'];
+    const hasCriticalError = criticalServices.some(service => 
+      healthStatus[service] === 'error'
+    );
+
+    if (hasCriticalError) {
+      healthStatus.status = 'degraded';
+      res.status(503).json(healthStatus);
+    } else {
+      res.status(200).json(healthStatus);
+    }
   } catch (error) {
     res.status(500).json({
       status: 'error',
       service: 'chat-service',
-      error: error.message
+      error: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -117,12 +192,14 @@ app.get('/health', async (req, res) => {
 // Import routes
 const chatRoutes = require('./routes/chatRoutes');
 const messageRoutes = require('./routes/messageRoutes');
+const adminRoutes = require('./routes/adminRoutes');
 
 // Use routes
-app.use("/api/chats", chatRoutes);
-app.use("/api/messages", messageRoutes);
+app.use("/api/chat", chatRoutes);
+app.use("/api/chat", messageRoutes);
 app.use("/api/method", chatRoutes);
 app.use("/api/resource", chatRoutes);
+app.use("/api/admin", adminRoutes);
 
 // Socket.IO events for real-time chat with enhanced features
 io.on('connection', (socket) => {
@@ -162,10 +239,10 @@ io.on('connection', (socket) => {
         return socket.emit('error', { message: 'Chat ID is required' });
       }
       
-      // Verify user has access to this chat
-      const chat = await database.get('chats', { name: chatId });
+      // Verify user has access to this chat using Mongoose
+      const chat = await Chat.findById(chatId).populate('participants', 'fullname email');
       if (chat) {
-        if (chat.participants.includes(userId)) {
+        if (chat.participants.some(p => p._id.toString() === userId.toString())) {
           socket.join(`chat:${chatId}`);
           
           // Mark user as active in this chat
@@ -174,7 +251,7 @@ io.on('connection', (socket) => {
           // Send chat info
           socket.emit('chat_joined', {
             chatId,
-            chatName: chatHelpers.generateChatDisplayName(chat, userId),
+            chatName: chat.name || `Chat with ${chat.participants.length} members`,
             participantCount: chat.participants.length,
             timestamp: new Date().toISOString()
           });
@@ -232,8 +309,8 @@ io.on('connection', (socket) => {
         return socket.emit('error', { message: 'Chat ID is required' });
       }
       
-      // Verify user has access to chat
-      const chat = await database.get('chats', { name: chatId });
+      // Verify user has access to chat using Mongoose
+      const chat = await Chat.findById(chatId);
       if (!chat) {
         return socket.emit('error', { message: 'Chat not found' });
       }
@@ -242,48 +319,35 @@ io.on('connection', (socket) => {
         return socket.emit('error', { message: 'No access to this chat' });
       }
       
-      // Sanitize message content
-      const sanitizedMessage = chatHelpers.sanitizeContent(message);
+      // Sanitize message content (simple sanitization for now)
+      const sanitizedMessage = message?.trim();
       
       if (!sanitizedMessage && messageType === 'text') {
         return socket.emit('error', { message: 'Message cannot be empty' });
       }
       
-      // Create message record
-      const messageData = {
-        name: `MSG-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      // Create message using Mongoose
+      const newMessage = new Message({
         chat: chatId,
         sender: userId,
-        message: sanitizedMessage,
-        message_type: messageType,
-        attachments: attachments || null,
-        reply_to: replyTo,
-        sent_at: new Date(),
-        delivery_status: 'sent',
-        read_by: [userId],
-        is_deleted: 0,
-        is_edited: 0,
-        is_pinned: 0
-      };
+        content: sanitizedMessage,
+        messageType: messageType,
+        attachments: attachments || [],
+        replyTo: replyTo || null,
+        sentAt: new Date(),
+        deliveryStatus: 'sent'
+      });
       
-      // Save to database
-      await database.insert('messages', messageData);
+      // Save message to database
+      await newMessage.save();
       
       // Update chat last message
-      const messageCount = await database.db.collection('messages').countDocuments({
-        chat: chatId,
-        is_deleted: { $ne: 1 }
-      });
-      
-      await database.update('chats', { name: chatId }, {
-        last_message: messageData.name,
-        last_message_time: messageData.sent_at,
-        message_count: messageCount,
-        updated_at: new Date()
-      });
+      chat.lastMessage = newMessage._id;
+      chat.updatedAt = new Date();
+      await chat.save();
       
       // Cache the message
-      await redisClient.cacheMessage(messageData.name, messageData);
+      await redisClient.cacheMessage(newMessage._id.toString(), newMessage);
       
       // Invalidate relevant caches
       await redisClient.invalidateChatMessagesCache(chatId);
@@ -294,27 +358,50 @@ io.on('connection', (socket) => {
       // Publish message event to other services
       await redisClient.publishChatEvent('message_sent', {
         chat_id: chatId,
-        message_id: messageData.name,
+        message_id: newMessage._id.toString(),
         sender_id: userId,
         message_preview: sanitizedMessage?.substring(0, 100),
         message_type: messageType,
-        timestamp: messageData.sent_at
+        timestamp: newMessage.sentAt
       });
       
       // Broadcast to chat room
-      io.to(`chat:${chatId}`).emit('new_message', {
-        ...messageData,
+      const messageData = {
+        _id: newMessage._id,
+        chat: newMessage.chat,
+        sender: newMessage.sender,
+        content: newMessage.content,
+        messageType: newMessage.messageType,
+        attachments: newMessage.attachments,
+        sentAt: newMessage.sentAt,
+        deliveryStatus: newMessage.deliveryStatus,
         sender_name: socket.user?.full_name || 'Unknown User',
         timestamp: new Date().toISOString()
-      });
+      };
+      
+      io.to(`chat:${chatId}`).emit('new_message', messageData);
       
       // Send delivery confirmation
       socket.emit('message_sent', { 
-        messageId: messageData.name, 
+        messageId: newMessage._id.toString(), 
         tempId,
         status: 'sent',
-        timestamp: messageData.sent_at
+        timestamp: newMessage.sentAt
       });
+
+      // Gửi notification cho participants (trừ sender)
+      try {
+        const offlineParticipants = chat.participants.filter(p => p.toString() !== userId.toString());
+        if (offlineParticipants.length > 0) {
+          await notificationService.sendNewMessageNotification({
+            ...messageData,
+            isGroup: chat.isGroup,
+            groupName: chat.name
+          }, offlineParticipants);
+        }
+      } catch (notifError) {
+        console.error('Failed to send notification:', notifError.message);
+      }
       
       // Stop typing indicator
       await redisClient.removeUserTyping(userId, chatId);
@@ -381,35 +468,35 @@ io.on('connection', (socket) => {
       let updatedCount = 0;
       
       if (messageIds.length > 0) {
-        // Mark specific messages as read
+        // Mark specific messages as read using Mongoose
         for (const messageId of messageIds) {
-          const message = await database.get('messages', { name: messageId });
-          if (message && !message.read_by.includes(userId)) {
-            message.read_by.push(userId);
-            await database.update('messages', { name: messageId }, {
-              read_by: message.read_by,
-              delivery_status: 'read',
-              updated_at: new Date()
+          const message = await Message.findById(messageId);
+          if (message && !message.readBy.some(r => r.user.toString() === userId.toString())) {
+            message.readBy.push({
+              user: userId,
+              readAt: new Date()
             });
+            message.deliveryStatus = 'read';
+            await message.save();
             updatedCount++;
           }
         }
       } else {
         // Mark all unread messages in chat as read
-        const unreadMessages = await database.getAll('messages', {
+        const unreadMessages = await Message.find({
           chat: chatId,
           sender: { $ne: userId },
-          read_by: { $ne: userId },
-          is_deleted: { $ne: 1 }
+          'readBy.user': { $ne: userId },
+          isDeleted: { $ne: true }
         });
         
         for (const message of unreadMessages) {
-          message.read_by.push(userId);
-          await database.update('messages', { name: message.name }, {
-            read_by: message.read_by,
-            delivery_status: 'read',
-            updated_at: new Date()
+          message.readBy.push({
+            user: userId,
+            readAt: new Date()
           });
+          message.deliveryStatus = 'read';
+          await message.save();
           updatedCount++;
         }
       }
@@ -489,9 +576,9 @@ cron.schedule('0 3 * * *', async () => {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
     
-    const result = await database.db.collection('messages').deleteMany({
-      sent_at: { $lt: cutoffDate },
-      is_pinned: { $ne: 1 }
+    const result = await Message.deleteMany({
+      sentAt: { $lt: cutoffDate },
+      isPinned: { $ne: true }
     });
     
     console.log(`✅ [Chat Service] Cleaned up ${result.deletedCount} old messages`);

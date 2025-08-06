@@ -1,18 +1,15 @@
 const express = require('express');
 const router = express.Router();
-const chatController = require('../controllers/chatController');
-const database = require('../config/database');
+const chatController = require('../controllers/chatControllerNew');
+const { authenticate } = require('../middleware/authMiddleware');
 
-// Chat management routes
-router.post('/create-or-get', chatController.createOrGetChat.bind(chatController));
-router.get('/user/:user_id', chatController.getUserChats.bind(chatController));
-router.post('/send-message', chatController.sendMessage.bind(chatController));
-router.get('/:chat_id/messages', chatController.getChatMessages.bind(chatController));
-router.post('/:chat_id/read', chatController.markMessagesRead.bind(chatController));
-router.post('/reply', chatController.replyToMessage.bind(chatController));
-router.post('/forward', chatController.forwardMessage.bind(chatController));
-router.delete('/message/:message_id', chatController.deleteMessage.bind(chatController));
-router.get('/search', chatController.searchMessages.bind(chatController));
+// Chat management routes (with authentication)
+router.post('/create-or-get', authenticate, chatController.createOrGetChat.bind(chatController));
+router.get('/user/:user_id', authenticate, chatController.getUserChats.bind(chatController));
+router.get('/:chat_id/messages', authenticate, chatController.getChatMessages.bind(chatController));
+router.post('/group', authenticate, chatController.createGroupChat.bind(chatController));
+router.post('/:chat_id/add-user', authenticate, chatController.addUserToGroupChat.bind(chatController));
+router.get('/:chat_id/stats', authenticate, chatController.getChatStats.bind(chatController));
 
 // Legacy create chat endpoint
 router.post('/create', async (req, res) => {
