@@ -109,7 +109,23 @@ class RedisClient {
   async handleNotificationEvent(message) {
     try {
       const data = JSON.parse(message);
-      console.log('📢 [Chat Service] Received notification event:', data);
+      
+      // Chỉ xử lý những events liên quan đến chat
+      const chatRelevantEvents = [
+        'user_online', 
+        'user_offline', 
+        'message_notification', 
+        'chat_created', 
+        'group_invitation',
+        'mention_notification'
+      ];
+
+      if (!chatRelevantEvents.includes(data.type)) {
+        // Skip events không liên quan đến chat (như attendance_recorded)
+        return;
+      }
+
+      console.log('📢 [Chat Service] Processing notification event:', data.type);
 
       // Handle different notification types
       switch (data.type) {
@@ -122,8 +138,13 @@ class RedisClient {
         case 'message_notification':
           await this.handleMessageNotification(data);
           break;
+        case 'chat_created':
+        case 'group_invitation':
+        case 'mention_notification':
+          console.log(`💬 [Chat Service] Handled ${data.type} notification`);
+          break;
         default:
-          console.log('📢 [Chat Service] Unknown notification type:', data.type);
+          console.log('📢 [Chat Service] Unknown chat notification type:', data.type);
       }
     } catch (error) {
       console.error('❌ [Chat Service] Error handling notification event:', error);
@@ -133,7 +154,22 @@ class RedisClient {
   async handleUserEvent(message) {
     try {
       const data = JSON.parse(message);
-      console.log('👤 [Chat Service] Received user event:', data);
+      
+      // Chỉ xử lý những user events liên quan đến chat
+      const chatRelevantUserEvents = [
+        'user_created',
+        'user_updated', 
+        'user_deleted',
+        'user_online_status_changed',
+        'user_profile_updated'
+      ];
+
+      if (!chatRelevantUserEvents.includes(data.type)) {
+        // Skip events không liên quan đến chat users
+        return;
+      }
+
+      console.log('👤 [Chat Service] Processing user event:', data.type);
 
       // Handle different user event types
       switch (data.type) {
@@ -141,13 +177,17 @@ class RedisClient {
           await this.handleUserCreated(data);
           break;
         case 'user_updated':
+        case 'user_profile_updated':
           await this.handleUserUpdated(data);
           break;
         case 'user_deleted':
           await this.handleUserDeleted(data);
           break;
+        case 'user_online_status_changed':
+          console.log(`👤 [Chat Service] User online status changed: ${data.user_id}`);
+          break;
         default:
-          console.log('👤 [Chat Service] Unknown user event type:', data.type);
+          console.log('👤 [Chat Service] Unknown chat-relevant user event type:', data.type);
       }
     } catch (error) {
       console.error('❌ [Chat Service] Error handling user event:', error);
