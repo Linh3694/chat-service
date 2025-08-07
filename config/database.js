@@ -8,9 +8,8 @@ class Database {
 
   async connect() {
     try {
-      // Sử dụng MongoDB local cho chat service
       const uri = process.env.MONGODB_URI || 
-        `mongodb://${process.env.MONGODB_HOST || 'localhost'}:${process.env.MONGODB_PORT || 27017}/${process.env.MONGODB_DATABASE || 'wellspring_chat'}`;
+        `mongodb://${process.env.MONGODB_HOST}:${process.env.MONGODB_PORT}/${process.env.MONGODB_DATABASE}`;
 
       const options = {
         useNewUrlParser: true,
@@ -18,8 +17,6 @@ class Database {
         maxPoolSize: 10,
         serverSelectionTimeoutMS: 5000,
         socketTimeoutMS: 45000,
-        // Tối ưu cho local development
-        connectTimeoutMS: 10000,
       };
 
       // Add authentication if credentials are provided
@@ -30,11 +27,9 @@ class Database {
         };
       }
 
-      console.log(`🔗 [Chat Service] Connecting to MongoDB: ${uri}`);
       this.connection = await mongoose.connect(uri, options);
       
-      console.log('✅ [Chat Service] MongoDB local connection established successfully');
-      console.log(`📊 [Chat Service] Database: ${mongoose.connection.name}`);
+      console.log('✅ [Chat Service] MongoDB connected successfully');
       
       // Handle connection events
       mongoose.connection.on('error', (err) => {
@@ -49,41 +44,9 @@ class Database {
         console.log('🔄 [Chat Service] MongoDB reconnected');
       });
 
-      // Tạo indexes nếu chưa có
-      await this.createIndexes();
-
     } catch (error) {
-      console.error('❌ [Chat Service] MongoDB local connection failed:', error.message);
+      console.error('❌ [Chat Service] MongoDB connection failed:', error.message);
       throw error;
-    }
-  }
-
-  async createIndexes() {
-    try {
-      const db = mongoose.connection.db;
-      
-      // Tạo collections nếu chưa có
-      const collections = await db.listCollections().toArray();
-      const collectionNames = collections.map(c => c.name);
-      
-      if (!collectionNames.includes('users')) {
-        await db.createCollection('users');
-        console.log('📋 [Chat Service] Created users collection');
-      }
-      
-      if (!collectionNames.includes('chats')) {
-        await db.createCollection('chats');
-        console.log('📋 [Chat Service] Created chats collection');
-      }
-      
-      if (!collectionNames.includes('messages')) {
-        await db.createCollection('messages');
-        console.log('📋 [Chat Service] Created messages collection');
-      }
-      
-      console.log('✅ [Chat Service] Database indexes and collections ready');
-    } catch (error) {
-      console.warn('⚠️ [Chat Service] Failed to create indexes:', error.message);
     }
   }
 
