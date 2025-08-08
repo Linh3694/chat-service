@@ -14,8 +14,14 @@ const authenticate = async (req, res, next) => {
     }
 
     try {
-      // Validate token with Frappe service
-      const frappeUser = await frappeService.authenticateUser(token);
+      // Thử xác thực qua ERP endpoint trước (Bearer JWT)
+      let frappeUser = null;
+      try {
+        frappeUser = await frappeService.validateERPToken(token);
+      } catch (e) {
+        // Fallback sang Frappe auth nếu ERP không hợp lệ
+        frappeUser = await frappeService.authenticateUser(token);
+      }
       
       if (frappeUser) {
         // Tạo hoặc cập nhật user trong local database

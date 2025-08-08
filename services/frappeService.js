@@ -26,9 +26,13 @@ class FrappeService {
     // Request interceptor để thêm auth headers
     this.api.interceptors.request.use(
       (config) => {
-        if (this.apiKey && this.apiSecret) {
-          config.headers['Authorization'] = `token ${this.apiKey}:${this.apiSecret}`;
+        // Chỉ gắn API Key nếu request KHÔNG đặt sẵn Authorization (ví dụ Bearer từ mobile)
+        const headers = config.headers || {};
+        const hasAuthHeader = !!(headers['Authorization'] || headers['authorization']);
+        if (!hasAuthHeader && this.apiKey && this.apiSecret) {
+          headers['Authorization'] = `token ${this.apiKey}:${this.apiSecret}`;
         }
+        config.headers = headers;
         
         console.log(`🔗 [Frappe Service] ${config.method?.toUpperCase()} ${config.url}`);
         return config;
@@ -140,6 +144,25 @@ class FrappeService {
       throw new Error('Authentication failed');
     } catch (error) {
       console.error('❌ [Frappe Service] Authentication failed:', error.message);
+      throw error;
+    }
+  }
+
+  // Xác thực token qua ERP custom endpoint (Bearer JWT)
+  async validateERPToken(token) {
+    try {
+      const response = await this.api.get('/api/method/erp.api.erp_common_user.auth.get_current_user', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'X-Frappe-CSRF-Token': token
+        }
+      });
+      if (response.data && response.data.status === 'success' && response.data.user) {
+        return response.data.user;
+      }
+      throw new Error('ERP token validation failed');
+    } catch (error) {
+      console.error('❌ [Frappe Service] ERP token validation failed:', error.message);
       throw error;
     }
   }
