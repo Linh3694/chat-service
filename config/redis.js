@@ -135,6 +135,12 @@ class RedisClient {
       const data = JSON.parse(message);
       console.log('👤 [Chat Service] Received user event:', data);
 
+      // Feature flag để bật/tắt xử lý user events an toàn
+      if (process.env.ENABLE_USER_EVENTS !== 'true') {
+        console.log('⚠️ [Chat Service] User events handling disabled by ENABLE_USER_EVENTS');
+        return;
+      }
+
       // Handle different user event types
       switch (data.type) {
         case 'user_created':
@@ -197,18 +203,93 @@ class RedisClient {
   }
 
   async handleUserCreated(data) {
-    // Handle user creation event
-    console.log('👤 [Chat Service] User created:', data.user_id);
+    // Upsert user ngay khi nhận event từ Frappe
+    try {
+      const User = require('../models/User');
+      const frappeService = require('../services/frappeService');
+
+      // Payload có thể gửi full user hoặc chỉ id
+      const possiblePayload = data.user || data.data || {};
+      let userPayload = null;
+
+      if (possiblePayload && (possiblePayload.name || possiblePayload.email)) {
+        userPayload = possiblePayload;
+      } else {
+        const identifier = data.user_id || data.userId || data.name || data.email;
+        if (identifier && frappeService.enabled) {
+          try {
+            const frappeUser = await frappeService.getUser(identifier);
+            userPayload = frappeUser;
+          } catch (e) {
+            console.warn('⚠️ [Chat Service] Could not fetch user from Frappe on create:', identifier, e.message);
+          }
+        }
+      }
+
+      if (userPayload) {
+        const doc = await User.updateFromFrappe(userPayload);
+        console.log('✅ [Chat Service] Upserted user from event:', { id: doc._id, email: doc.email, name: doc.fullname });
+      } else {
+        console.log('⚠️ [Chat Service] No usable payload to upsert user on create');
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Error handling user_created:', error);
+    }
   }
 
   async handleUserUpdated(data) {
-    // Handle user update event
-    console.log('👤 [Chat Service] User updated:', data.user_id);
+    // Tương tự tạo mới: upsert theo payload mới nhất
+    try {
+      const User = require('../models/User');
+      const frappeService = require('../services/frappeService');
+
+      const possiblePayload = data.user || data.data || {};
+      let userPayload = null;
+
+      if (possiblePayload && (possiblePayload.name || possiblePayload.email)) {
+        userPayload = possiblePayload;
+      } else {
+        const identifier = data.user_id || data.userId || data.name || data.email;
+        if (identifier && frappeService.enabled) {
+          try {
+            const frappeUser = await frappeService.getUser(identifier);
+            userPayload = frappeUser;
+          } catch (e) {
+            console.warn('⚠️ [Chat Service] Could not fetch user from Frappe on update:', identifier, e.message);
+          }
+        }
+      }
+
+      if (userPayload) {
+        const doc = await User.updateFromFrappe(userPayload);
+        console.log('✅ [Chat Service] Upserted user from update event:', { id: doc._id, email: doc.email });
+      } else {
+        console.log('⚠️ [Chat Service] No usable payload to upsert user on update');
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Error handling user_updated:', error);
+    }
   }
 
   async handleUserDeleted(data) {
-    // Handle user deletion event
-    console.log('👤 [Chat Service] User deleted:', data.user_id);
+    // Xóa user local khi nhận event xóa
+    try {
+      const User = require('../models/User');
+      const identifier = data.user_id || data.userId || data.name || data.email;
+      if (!identifier) {
+        console.warn('⚠️ [Chat Service] user_deleted without identifier');
+        return;
+      }
+      // Tùy chọn cho phép xóa thực sự; mặc định chỉ log để an toàn
+      if (process.env.USER_EVENT_DELETE_ENABLED === 'true') {
+        const result = await User.deleteOne({ $or: [ { frappeUserId: identifier }, { email: identifier } ] });
+        console.log('🗑️ [Chat Service] Deleted user from event:', identifier, 'acknowledged:', result.acknowledged, 'deletedCount:', result.deletedCount);
+      } else {
+        console.log('🗑️ [Chat Service] user_deleted received but deletion disabled. Identifier:', identifier);
+      }
+    } catch (error) {
+      console.error('❌ [Chat Service] Error handling user_deleted:', error);
+    }
   }
 
   // Publish events to other services
