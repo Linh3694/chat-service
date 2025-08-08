@@ -64,6 +64,8 @@ const io = new Server(server, {
 
 // Make io globally available for Redis pub/sub
 global.io = io;
+// Group chat namespace
+const groupNs = io.of('/groupchat');
 
 // Setup Redis adapter
 (async () => {
@@ -197,6 +199,9 @@ const adminRoutes = require('./routes/adminRoutes');
 // Use routes
 app.use("/api/chat", chatRoutes);
 app.use("/api/chat", messageRoutes);
+// Backward-compatible aliases to support legacy mobile paths
+app.use("/api/chats", chatRoutes);
+app.use("/api/chats", messageRoutes);
 app.use("/api/method", chatRoutes);
 app.use("/api/resource", chatRoutes);
 app.use("/api/admin", adminRoutes);
@@ -220,18 +225,20 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString()
     });
     
-    // Broadcast user online status
-    socket.broadcast.emit('user_online', { 
+    // Broadcast user online status (both snake_case and camelCase for compatibility)
+    const onlinePayload = { 
       userId, 
       timestamp: new Date().toISOString(),
       socketId: socket.id 
-    });
+    };
+    socket.broadcast.emit('user_online', onlinePayload);
+    socket.broadcast.emit('userOnline', onlinePayload);
     
     console.log(`👤 [Chat Service] User ${userId} connected with socket ${socket.id}`);
   }
   
   // Join chat room with validation
-  socket.on('join_chat', async (data) => {
+  const handleJoinChat = async (data) => {
     try {
       const { chatId } = data;
       
@@ -244,6 +251,8 @@ io.on('connection', (socket) => {
       if (chat) {
         if (chat.participants.some(p => p._id.toString() === userId.toString())) {
           socket.join(`chat:${chatId}`);
+          // Also join plain room id for legacy clients
+          socket.join(chatId.toString());
           
           // Mark user as active in this chat
           await redisClient.setUserActiveInChat(userId, chatId);
@@ -267,13 +276,16 @@ io.on('connection', (socket) => {
       console.error('Error joining chat:', error);
       socket.emit('error', { message: 'Failed to join chat' });
     }
-  });
+  };
+  socket.on('join_chat', handleJoinChat);
+  socket.on('joinChat', handleJoinChat);
   
   // Leave chat room
   socket.on('leave_chat', async (data) => {
     try {
       const { chatId } = data;
       socket.leave(`chat:${chatId}`);
+      socket.leave(chatId?.toString());
       await redisClient.removeUserFromActiveChat(userId, chatId);
       await redisClient.removeUserTyping(userId, chatId);
       
@@ -380,6 +392,9 @@ io.on('connection', (socket) => {
       };
       
       io.to(`chat:${chatId}`).emit('new_message', messageData);
+      // Legacy compatibility: emit receiveMessage to plain room and group namespace
+      io.to(chatId.toString()).emit('receiveMessage', messageData);
+      groupNs.to(chatId.toString()).emit('receiveMessage', messageData);
       
       // Send delivery confirmation
       socket.emit('message_sent', { 
@@ -416,30 +431,37 @@ io.on('connection', (socket) => {
   });
   
   // Enhanced typing indicators with timeout
-  socket.on('typing_start', async (data) => {
+  const handleTypingStart = async (data) => {
     try {
       const { chatId } = data;
       
       if (!chatId) return;
       
       await redisClient.setUserTyping(userId, chatId);
-      socket.to(`chat:${chatId}`).emit('user_typing', { 
+      const payload = { 
         userId, 
         chatId, 
         userName: socket.user?.full_name || 'Unknown User',
         timestamp: new Date().toISOString() 
-      });
+      };
+      socket.to(`chat:${chatId}`).emit('user_typing', payload);
+      socket.to(chatId.toString()).emit('userTyping', payload);
+      groupNs.to(chatId.toString()).emit('userTypingInGroup', payload);
       
       // Auto-stop typing after timeout
       setTimeout(async () => {
         await redisClient.removeUserTyping(userId, chatId);
         socket.to(`chat:${chatId}`).emit('user_stopped_typing', { userId, chatId });
+        socket.to(chatId.toString()).emit('userStopTyping', { userId, chatId });
+        groupNs.to(chatId.toString()).emit('userStopTypingInGroup', { userId, chatId });
       }, chatHelpers.getTypingTimeout());
       
     } catch (error) {
       console.error('Error handling typing start:', error);
     }
-  });
+  };
+  socket.on('typing_start', handleTypingStart);
+  socket.on('typing', handleTypingStart);
   
   socket.on('typing_stop', async (data) => {
     try {
@@ -448,18 +470,27 @@ io.on('connection', (socket) => {
       if (!chatId) return;
       
       await redisClient.removeUserTyping(userId, chatId);
-      socket.to(`chat:${chatId}`).emit('user_stopped_typing', { 
-        userId, 
-        chatId, 
-        timestamp: new Date().toISOString() 
-      });
+      const payload = { userId, chatId, timestamp: new Date().toISOString() };
+      socket.to(`chat:${chatId}`).emit('user_stopped_typing', payload);
+      socket.to(chatId.toString()).emit('userStopTyping', payload);
+      groupNs.to(chatId.toString()).emit('userStopTypingInGroup', payload);
     } catch (error) {
       console.error('Error handling typing stop:', error);
     }
   });
+  socket.on('stopTyping', async (data) => {
+    try {
+      const { chatId } = data || {};
+      if (!chatId) return;
+      const payload = { userId, chatId, timestamp: new Date().toISOString() };
+      socket.to(`chat:${chatId}`).emit('user_stopped_typing', payload);
+      socket.to(chatId.toString()).emit('userStopTyping', payload);
+      groupNs.to(chatId.toString()).emit('userStopTypingInGroup', payload);
+    } catch {}
+  });
   
   // Enhanced message read receipts
-  socket.on('mark_messages_read', async (data) => {
+  const handleMarkRead = async (data) => {
     try {
       const { chatId, messageIds = [] } = data;
       
@@ -514,20 +545,25 @@ io.on('connection', (socket) => {
         });
         
         // Broadcast read receipts
-        socket.to(`chat:${chatId}`).emit('messages_read', {
+        const payload = {
           userId,
           userName: socket.user?.full_name || 'Unknown User',
           chatId,
           messageIds: messageIds.length > 0 ? messageIds : 'all',
           count: updatedCount,
           timestamp: new Date().toISOString()
-        });
+        };
+        socket.to(`chat:${chatId}`).emit('messages_read', payload);
+        socket.to(chatId.toString()).emit('messageRead', payload);
+        groupNs.to(chatId.toString()).emit('messageRead', payload);
       }
       
     } catch (error) {
       console.error('Error marking messages as read:', error);
     }
-  });
+  };
+  socket.on('mark_messages_read', handleMarkRead);
+  socket.on('messageRead', handleMarkRead);
   
   // Handle disconnect
   socket.on('disconnect', async () => {
@@ -551,11 +587,10 @@ io.on('connection', (socket) => {
         socket.to(`chat:${chatId}`).emit('user_stopped_typing', { userId, chatId });
       }
       
-      // Broadcast user offline status
-      socket.broadcast.emit('user_offline', { 
-        userId, 
-        timestamp: new Date().toISOString() 
-      });
+      // Broadcast user offline status (both styles)
+      const offlinePayload = { userId, timestamp: new Date().toISOString() };
+      socket.broadcast.emit('user_offline', offlinePayload);
+      socket.broadcast.emit('userOffline', offlinePayload);
       
       console.log(`👤 [Chat Service] User ${userId} disconnected`);
     }
@@ -564,6 +599,35 @@ io.on('connection', (socket) => {
   // Handle errors
   socket.on('error', (error) => {
     console.error('🔌 [Chat Service] Socket error:', error);
+  });
+});
+
+// Group chat namespace events (minimal for compatibility)
+groupNs.on('connection', (socket) => {
+  const userId = socket.handshake?.auth?.userId || socket.user?._id;
+  console.log('🔌 [/groupchat] Client connected:', socket.id);
+
+  socket.on('joinGroupChat', ({ chatId }) => {
+    if (!chatId) return;
+    socket.join(chatId.toString());
+    socket.emit('roomJoinConfirmed', { chatId, roomSize: groupNs.adapter.rooms.get(chatId.toString())?.size || 1 });
+  });
+
+  socket.on('groupTyping', ({ chatId, userId: typingUserId, isTyping }) => {
+    if (!chatId || !typingUserId) return;
+    if (isTyping) {
+      groupNs.to(chatId.toString()).emit('userTypingInGroup', { userId: typingUserId, chatId });
+    } else {
+      groupNs.to(chatId.toString()).emit('userStopTypingInGroup', { userId: typingUserId, chatId });
+    }
+  });
+
+  socket.on('leaveGroupChat', ({ chatId }) => {
+    socket.leave(chatId?.toString());
+  });
+
+  socket.on('disconnect', () => {
+    // no-op
   });
 });
 

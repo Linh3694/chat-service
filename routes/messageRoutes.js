@@ -3,6 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const messageController = require('../controllers/messageController');
+const { authenticate } = require('../middleware/authMiddleware');
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -34,16 +35,24 @@ const upload = multer({
   }
 });
 
-// Message management routes
-router.get('/:message_id', messageController.getMessage.bind(messageController));
-router.post('/upload', upload.single('file'), messageController.uploadAttachment.bind(messageController));
-router.get('/attachment/:attachment_id/download', messageController.downloadAttachment.bind(messageController));
-router.get('/:message_id/reactions', messageController.getMessageReactions.bind(messageController));
-router.post('/:message_id/react', messageController.addReaction.bind(messageController));
-router.post('/:message_id/pin', messageController.togglePinMessage.bind(messageController));
-router.get('/chat/:chat_id/pinned', messageController.getPinnedMessages.bind(messageController));
-router.get('/:message_id/history', messageController.getMessageHistory.bind(messageController));
-router.put('/:message_id/edit', messageController.editMessage.bind(messageController));
+// Message management routes (with auth)
+router.get('/:message_id', authenticate, messageController.getMessage.bind(messageController));
+router.post('/upload', authenticate, upload.single('file'), messageController.uploadAttachment.bind(messageController));
+router.get('/attachment/:attachment_id/download', authenticate, messageController.downloadAttachment.bind(messageController));
+router.get('/:message_id/reactions', authenticate, messageController.getMessageReactions.bind(messageController));
+router.post('/:message_id/react', authenticate, messageController.addReaction.bind(messageController));
+router.post('/:message_id/pin', authenticate, messageController.togglePinMessage.bind(messageController));
+router.delete('/:message_id/pin', authenticate, messageController.togglePinMessage.bind(messageController));
+router.get('/chat/:chat_id/pinned', authenticate, messageController.getPinnedMessages.bind(messageController));
+router.get('/:message_id/history', authenticate, messageController.getMessageHistory.bind(messageController));
+router.put('/:message_id/edit', authenticate, messageController.editMessage.bind(messageController));
+
+// Aliases to match mobile legacy endpoints
+// GET /api/chats/:chatId/pinned-messages
+router.get('/:chatId/pinned-messages', authenticate, (req, res, next) => {
+  req.params.chat_id = req.params.chatId;
+  return messageController.getPinnedMessages(req, res, next);
+});
 
 // Frappe resource API for messages
 router.get('/ERP%20Chat%20Message', async (req, res) => {

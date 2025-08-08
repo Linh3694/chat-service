@@ -86,6 +86,151 @@ class ChatController {
     }
   }
 
+  // Send message (Mongoose-based)
+  async sendMessage(req, res) {
+    try {
+      const body = req.body || {};
+      const chatId = body.chat_id || body.chatId;
+      const senderId = req.user?._id || req.user?.id;
+      const content = (body.content || '').trim();
+      const messageType = body.message_type || body.type || 'text';
+      const replyTo = body.reply_to || body.replyTo || null;
+
+      if (!chatId || !senderId) {
+        return res.status(400).json({ error: 'chat_id and sender are required' });
+      }
+
+      // Verify chat & permission
+      const chat = await Chat.findById(chatId);
+      if (!chat) return res.status(404).json({ error: 'Chat not found' });
+      if (!chat.participants.some(p => p.toString() === senderId.toString())) {
+        return res.status(403).json({ error: 'No access to this chat' });
+      }
+
+      if (!content && !(body.is_emoji || body.isEmoji)) {
+        return res.status(400).json({ error: 'Content cannot be empty' });
+      }
+
+      // Create message
+      const message = await Message.create({
+        chat: chatId,
+        sender: senderId,
+        content,
+        messageType,
+        replyTo: replyTo || undefined,
+        attachments: body.attachments || [],
+        isEmoji: !!(body.is_emoji || body.isEmoji),
+        emojiId: body.emoji_id || body.emojiId,
+        emojiType: body.emoji_type || body.emojiType,
+        emojiName: body.emoji_name || body.emojiName,
+        emojiUrl: body.emoji_url || body.emojiUrl,
+      });
+
+      // Update chat lastMessage
+      chat.lastMessage = message._id;
+      chat.updatedAt = new Date();
+      await chat.save();
+
+      const populatedMessage = await Message.findById(message._id)
+        .populate('sender', 'fullname avatarUrl email')
+        .populate({ path: 'replyTo', populate: { path: 'sender', select: 'fullname avatarUrl email' } });
+
+      // Emit compatibility event for legacy mobile (if io exists)
+      const io = req.app?.get('io');
+      if (io) {
+        io.to(chatId.toString()).emit('receiveMessage', populatedMessage);
+      }
+
+      return res.status(201).json(populatedMessage);
+    } catch (error) {
+      console.error('Error in sendMessage (new):', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
+  // Mark messages as read for a chat
+  async markMessagesRead(req, res) {
+    try {
+      const chatId = req.params.chat_id || req.params.chatId;
+      const userId = req.user?._id || req.user?.id;
+      if (!chatId || !userId) return res.status(400).json({ error: 'chatId and user required' });
+
+      const chat = await Chat.findById(chatId);
+      if (!chat) return res.status(404).json({ error: 'Chat not found' });
+      if (!chat.participants.some(p => p.toString() === userId.toString())) {
+        return res.status(403).json({ error: 'No access to this chat' });
+      }
+
+      await Message.updateMany(
+        { chat: chatId, sender: { $ne: userId }, 'readBy.user': { $ne: userId } },
+        { $push: { readBy: { user: userId, readAt: new Date() } }, $set: { deliveryStatus: 'read' } }
+      );
+
+      return res.json({ success: true });
+    } catch (error) {
+      console.error('Error in markMessagesRead (new):', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
+  // Reply to message (Mongoose-based)
+  async replyToMessage(req, res) {
+    try {
+      const body = req.body || {};
+      req.body = { ...body, message_type: body.message_type || body.type || 'text' };
+      return this.sendMessage(req, res);
+    } catch (error) {
+      console.error('Error in replyToMessage (new):', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
+  // Forward message (Mongoose-based)
+  async forwardMessage(req, res) {
+    try {
+      const body = req.body || {};
+      const originalId = body.message_id || body.messageId;
+      const toChatId = body.to_chat_id || body.toChatId;
+      const senderId = req.user?._id || req.user?.id;
+
+      const originalMessage = await Message.findById(originalId);
+      if (!originalMessage) return res.status(404).json({ error: 'Original message not found' });
+
+      const chat = await Chat.findById(toChatId);
+      if (!chat) return res.status(404).json({ error: 'Target chat not found' });
+      if (!chat.participants.some(p => p.toString() === senderId.toString())) {
+        return res.status(403).json({ error: 'No access to target chat' });
+      }
+
+      const forwarded = await Message.create({
+        chat: toChatId,
+        sender: senderId,
+        content: originalMessage.content,
+        messageType: originalMessage.messageType,
+        isForwarded: true,
+        originalMessage: originalMessage._id,
+        originalSender: originalMessage.sender,
+        attachments: originalMessage.attachments,
+      });
+
+      await Chat.findByIdAndUpdate(toChatId, { lastMessage: forwarded._id, updatedAt: new Date() });
+
+      const populatedMessage = await Message.findById(forwarded._id)
+        .populate('sender', 'fullname avatarUrl email')
+        .populate('originalSender', 'fullname avatarUrl email');
+
+      const io = req.app?.get('io');
+      if (io) {
+        io.to(toChatId.toString()).emit('receiveMessage', populatedMessage);
+      }
+
+      return res.status(201).json(populatedMessage);
+    } catch (error) {
+      console.error('Error in forwardMessage (new):', error);
+      return res.status(500).json({ error: 'Internal server error', message: error.message });
+    }
+  }
+
   // Get user's chats with pagination
   async getUserChats(req, res) {
     try {
