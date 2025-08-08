@@ -195,6 +195,7 @@ app.get('/health', async (req, res) => {
 const chatRoutes = require('./routes/chatRoutes');
 const messageRoutes = require('./routes/messageRoutes');
 const adminRoutes = require('./routes/adminRoutes');
+const userRoutes = require('./routes/userRoutes');
 
 // Use routes
 app.use("/api/chat", chatRoutes);
@@ -205,6 +206,7 @@ app.use("/api/chats", messageRoutes);
 app.use("/api/method", chatRoutes);
 app.use("/api/resource", chatRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/users", userRoutes);
 
 // Socket.IO events for real-time chat with enhanced features
 io.on('connection', (socket) => {
