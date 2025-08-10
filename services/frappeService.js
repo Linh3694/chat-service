@@ -8,6 +8,8 @@ class FrappeService {
     this.apiKey = process.env.FRAPPE_API_KEY;
     this.apiSecret = process.env.FRAPPE_API_SECRET;
     this.enabled = process.env.ENABLE_FRAPPE_SYNC === 'true';
+    this.authCache = new Map(); // token -> { user, exp }
+    this.cacheTtlMs = parseInt(process.env.FRAPPE_AUTH_CACHE_TTL_MS || '60000', 10); // default 60s
     
     // Axios instance với cấu hình mặc định
     this.api = axios.create({
@@ -117,6 +119,10 @@ class FrappeService {
         throw new Error('Frappe sync is disabled');
       }
 
+      // Token cache
+      const cached = this._getCachedUser(token);
+      if (cached) return cached;
+
       // Lấy thông tin user hiện tại bằng token
       const response = await this.api.get('/api/method/frappe.auth.get_logged_user', {
         headers: {
@@ -137,7 +143,9 @@ class FrappeService {
         });
 
         if (userResponse.data && userResponse.data.data) {
-          return userResponse.data.data;
+          const user = userResponse.data.data;
+          this._setCachedUser(token, user);
+          return user;
         }
       }
       
@@ -151,6 +159,10 @@ class FrappeService {
   // Xác thực token qua ERP custom endpoint (Bearer JWT)
   async validateERPToken(token) {
     try {
+      // Token cache
+      const cached = this._getCachedUser(token);
+      if (cached) return cached;
+
       const response = await this.api.get('/api/method/erp.api.erp_common_user.auth.get_current_user', {
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -158,13 +170,34 @@ class FrappeService {
         }
       });
       if (response.data && response.data.status === 'success' && response.data.user) {
-        return response.data.user;
+        const user = response.data.user;
+        this._setCachedUser(token, user);
+        return user;
       }
       throw new Error('ERP token validation failed');
     } catch (error) {
       console.error('❌ [Frappe Service] ERP token validation failed:', error.message);
       throw error;
     }
+  }
+
+  _getCachedUser(token) {
+    try {
+      const entry = this.authCache.get(token);
+      if (!entry) return null;
+      if (Date.now() < entry.exp) return entry.user;
+      this.authCache.delete(token);
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _setCachedUser(token, user) {
+    try {
+      const ttl = Number.isFinite(this.cacheTtlMs) ? this.cacheTtlMs : 60000;
+      this.authCache.set(token, { user, exp: Date.now() + ttl });
+    } catch (_) {}
   }
 
   // Đồng bộ user từ Frappe vào local database
