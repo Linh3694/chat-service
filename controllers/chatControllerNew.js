@@ -1,5 +1,6 @@
 const Chat = require('../models/Chat');
 const Message = require('../models/Message');
+const User = require('../models/User');
 const redisClient = require('../config/redis');
 const axios = require('axios');
 
@@ -343,7 +344,7 @@ class ChatController {
   async createGroupChat(req, res) {
     try {
       const mongoose = require('mongoose');
-      const { name, description, participant_ids } = req.body;
+      const { name, description, participant_ids, participant_emails, participant_frappe_ids } = req.body;
       const creator_id_raw = req.user?._id || req.user?.id;
       const isValidObjectId = (v) => !!v && typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
 
@@ -351,14 +352,51 @@ class ChatController {
         return res.status(400).json({ error: 'Group name is required' });
       }
 
-      // Include creator in participants
+      // Include creator and resolve participants by multiple keys (ids, emails, frappe ids)
       const inputParticipants = Array.isArray(participant_ids) ? participant_ids : [];
-      const baseParticipants = [];
-      if (isValidObjectId(creator_id_raw)) baseParticipants.push(creator_id_raw);
+      const inputEmails = Array.isArray(participant_emails) ? participant_emails : [];
+      const inputFrappeIds = Array.isArray(participant_frappe_ids) ? participant_frappe_ids : [];
+
+      const accumulator = new Set();
+      if (isValidObjectId(creator_id_raw)) accumulator.add(creator_id_raw);
       for (const p of inputParticipants) {
-        if (isValidObjectId(p)) baseParticipants.push(p);
+        if (isValidObjectId(p)) accumulator.add(p);
       }
-      const participants = Array.from(new Set(baseParticipants));
+
+      // Resolve by emails → ensure there is a local User and collect its _id
+      if (inputEmails.length > 0) {
+        for (const emailRaw of inputEmails) {
+          const email = (emailRaw || '').toString().trim().toLowerCase();
+          if (!email) continue;
+          try {
+            let user = await User.findOne({ email }).lean();
+            if (!user) {
+              // Create a minimal user so we have a stable local ObjectId
+              const created = await User.create({ email, fullname: email.split('@')[0] });
+              user = created.toObject();
+            }
+            if (user && user._id) accumulator.add(user._id.toString());
+          } catch (_) {}
+        }
+      }
+
+      // Resolve by frappe ids
+      if (inputFrappeIds.length > 0) {
+        for (const fidRaw of inputFrappeIds) {
+          const fid = (fidRaw || '').toString().trim();
+          if (!fid) continue;
+          try {
+            let user = await User.findOne({ frappeUserId: fid }).lean();
+            if (!user) {
+              const created = await User.create({ frappeUserId: fid, fullname: fid });
+              user = created.toObject();
+            }
+            if (user && user._id) accumulator.add(user._id.toString());
+          } catch (_) {}
+        }
+      }
+
+      const participants = Array.from(accumulator);
 
       if (participants.length === 0) {
         return res.status(400).json({ error: 'No valid participant ids provided' });

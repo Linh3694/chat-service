@@ -145,13 +145,21 @@ const authenticateWithAPIKey = async (req, res, next) => {
 
 module.exports = { authenticate, authenticateWithAPIKey };
 
-// Service-to-service auth or fallback to user auth
+// Service-to-service auth or user auth (prefer user if Authorization is present)
 const authenticateServiceOrUser = async (req, res, next) => {
   try {
+    // If client provides a user Authorization token, prefer authenticating the real user.
+    // This ensures created chats include the correct participant (current user) IDs
+    // so mobile ChatScreen can see newly created groups.
+    const hasUserAuth = !!(req.header('Authorization') || req.header('X-Frappe-CSRF-Token'));
+    if (hasUserAuth) {
+      return authenticate(req, res, next);
+    }
+
+    // Otherwise accept trusted service-to-service calls
     const svcToken = req.header('X-Service-Token') || req.header('X-Internal-Token');
     const expected = process.env.CHAT_INTERNAL_TOKEN || process.env.INTERNAL_SERVICE_TOKEN;
     if (svcToken && expected && svcToken === expected) {
-      // Mark as service request; allow optional impersonation
       const impersonateId = req.header('X-Impersonate-User');
       req.user = {
         _id: impersonateId || 'system',
@@ -164,8 +172,8 @@ const authenticateServiceOrUser = async (req, res, next) => {
       };
       return next();
     }
-    // Fallback to normal user auth
-    return authenticate(req, res, next);
+
+    return res.status(401).json({ success: false, message: 'Authentication required' });
   } catch (error) {
     console.error('❌ [Chat Service] Service auth error:', error.message);
     return res.status(401).json({ success: false, message: 'Service authentication failed' });
