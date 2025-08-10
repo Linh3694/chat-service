@@ -14,13 +14,17 @@ const authenticate = async (req, res, next) => {
     }
 
     try {
-      // Thử xác thực qua ERP endpoint trước (Bearer JWT)
+      // Ưu tiên xác thực chuẩn qua Frappe trước (Bearer token do client gửi)
       let frappeUser = null;
       try {
-        frappeUser = await frappeService.validateERPToken(token);
-      } catch (e) {
-        // Fallback sang Frappe auth nếu ERP không hợp lệ
         frappeUser = await frappeService.authenticateUser(token);
+      } catch (e1) {
+        // Fallback: thử ERP custom endpoint
+        try {
+          frappeUser = await frappeService.validateERPToken(token);
+        } catch (e2) {
+          frappeUser = null;
+        }
       }
       
       if (frappeUser) {
@@ -129,3 +133,32 @@ const authenticateWithAPIKey = async (req, res, next) => {
 };
 
 module.exports = { authenticate, authenticateWithAPIKey };
+
+// Service-to-service auth or fallback to user auth
+const authenticateServiceOrUser = async (req, res, next) => {
+  try {
+    const svcToken = req.header('X-Service-Token') || req.header('X-Internal-Token');
+    const expected = process.env.CHAT_INTERNAL_TOKEN || process.env.INTERNAL_SERVICE_TOKEN;
+    if (svcToken && expected && svcToken === expected) {
+      // Mark as service request; allow optional impersonation
+      const impersonateId = req.header('X-Impersonate-User');
+      req.user = {
+        _id: impersonateId || 'system',
+        id: impersonateId || 'system',
+        fullname: 'ticket-service',
+        email: 'system@ticket-service',
+        role: 'system',
+        roles: ['system'],
+        isService: true,
+      };
+      return next();
+    }
+    // Fallback to normal user auth
+    return authenticate(req, res, next);
+  } catch (error) {
+    console.error('❌ [Chat Service] Service auth error:', error.message);
+    return res.status(401).json({ success: false, message: 'Service authentication failed' });
+  }
+};
+
+module.exports.authenticateServiceOrUser = authenticateServiceOrUser;

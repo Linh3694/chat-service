@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const chatController = require('../controllers/chatControllerNew');
-const { authenticate } = require('../middleware/authMiddleware');
+const { authenticate, authenticateServiceOrUser } = require('../middleware/authMiddleware');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
@@ -13,9 +13,9 @@ router.post('/create-or-get', authenticate, chatController.createOrGetChat.bind(
 router.get('/user/:user_id', authenticate, chatController.getUserChats.bind(chatController));
 router.get('/:chat_id/messages', authenticate, chatController.getChatMessages.bind(chatController));
 // Group create (alias)
-router.post('/group', authenticate, chatController.createGroupChat.bind(chatController));
-router.post('/group/create', authenticate, chatController.createGroupChat.bind(chatController));
-router.post('/:chat_id/add-user', authenticate, chatController.addUserToGroupChat.bind(chatController));
+router.post('/group', authenticateServiceOrUser, chatController.createGroupChat.bind(chatController));
+router.post('/group/create', authenticateServiceOrUser, chatController.createGroupChat.bind(chatController));
+router.post('/:chat_id/add-user', authenticateServiceOrUser, chatController.addUserToGroupChat.bind(chatController));
 router.get('/:chat_id/stats', authenticate, chatController.getChatStats.bind(chatController));
 
 // ===== Aliases to support legacy mobile app endpoints =====
