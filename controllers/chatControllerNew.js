@@ -414,8 +414,9 @@ class ChatController {
         });
       }
 
-      // Check permissions
-      if (!chat.admins.includes(current_user_id) && chat.creator.toString() !== current_user_id.toString()) {
+      // Check permissions (allow service-to-service bypass)
+      const isService = req.user && (req.user.isService === true || req.user.role === 'system');
+      if (!isService && !chat.admins.includes(current_user_id) && chat.creator.toString() !== current_user_id.toString()) {
         return res.status(403).json({
           error: 'Only admins can add users'
         });

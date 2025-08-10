@@ -193,7 +193,7 @@ router.post('/createOrGet', authenticate, async (req, res) => {
 });
 
 // GET chat detail /api/chats/:chatId
-router.get('/:chatId', authenticate, async (req, res) => {
+router.get('/:chatId', authenticateServiceOrUser, async (req, res) => {
   try {
     const chat = await Chat.findById(req.params.chatId)
       .populate('participants', 'fullname avatarUrl email')
@@ -203,10 +203,13 @@ router.get('/:chatId', authenticate, async (req, res) => {
     if (!chat) {
       return res.status(404).json({ message: 'Không tìm thấy chat' });
     }
-    const userId = (req.user?._id || req.user?.id)?.toString();
-    const isParticipant = chat.participants.some(p => p._id.toString() === userId);
-    if (!isParticipant) {
-      return res.status(403).json({ message: 'Bạn không có quyền truy cập chat này' });
+    const isService = req.user && (req.user.isService === true || req.user.role === 'system');
+    if (!isService) {
+      const userId = (req.user?._id || req.user?.id)?.toString();
+      const isParticipant = chat.participants.some(p => p._id.toString() === userId);
+      if (!isParticipant) {
+        return res.status(403).json({ message: 'Bạn không có quyền truy cập chat này' });
+      }
     }
     return res.status(200).json(chat);
   } catch (error) {
