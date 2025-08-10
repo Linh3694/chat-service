@@ -1,5 +1,7 @@
 const frappeService = require('../services/frappeService');
 const User = require('../models/User');
+const lastAuthLogByUser = new Map(); // userId/email -> timestamp
+const AUTH_LOG_INTERVAL_MS = parseInt(process.env.AUTH_LOG_INTERVAL_MS || '60000', 10);
 
 const authenticate = async (req, res, next) => {
   try {
@@ -53,7 +55,16 @@ const authenticate = async (req, res, next) => {
           token: token
         };
         
-        console.log(`🔐 [Chat Service] User authenticated: ${localUser.fullName} (${localUser.email})`);
+        // Throttle auth log to avoid spam
+        try {
+          const key = localUser.email || localUser._id?.toString() || 'unknown';
+          const now = Date.now();
+          const last = lastAuthLogByUser.get(key) || 0;
+          if (process.env.AUTH_VERBOSE === 'true' || now - last > AUTH_LOG_INTERVAL_MS) {
+            console.log(`🔐 [Chat Service] User authenticated: ${localUser.fullName} (${localUser.email})`);
+            lastAuthLogByUser.set(key, now);
+          }
+        } catch (_) {}
         next();
       } else {
         return res.status(401).json({ 
