@@ -345,14 +345,13 @@ class ChatController {
       const { name, description, participant_ids } = req.body;
       const creator_id = req.user._id;
 
-      if (!name || !participant_ids || participant_ids.length < 2) {
-        return res.status(400).json({
-          error: 'Group name and at least 2 participants required'
-        });
+      if (!name) {
+        return res.status(400).json({ error: 'Group name is required' });
       }
 
       // Include creator in participants
-      const participants = [...new Set([creator_id, ...participant_ids])];
+      const inputParticipants = Array.isArray(participant_ids) ? participant_ids : [];
+      const participants = [...new Set([creator_id, ...inputParticipants])];
 
       const groupChat = new Chat({
         name: name,
@@ -384,10 +383,7 @@ class ChatController {
         await redisClient.invalidateUserChatsCache(participantId);
       }
 
-      res.status(201).json({
-        message: populatedChat,
-        status: 'success'
-      });
+      res.status(201).json({ message: populatedChat, status: 'success' });
 
     } catch (error) {
       console.error('Error in createGroupChat:', error);
