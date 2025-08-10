@@ -342,8 +342,10 @@ class ChatController {
   // Create group chat
   async createGroupChat(req, res) {
     try {
+      const mongoose = require('mongoose');
       const { name, description, participant_ids } = req.body;
-      const creator_id = req.user._id;
+      const creator_id_raw = req.user?._id || req.user?.id;
+      const isValidObjectId = (v) => !!v && typeof v === 'string' && mongoose.Types.ObjectId.isValid(v);
 
       if (!name) {
         return res.status(400).json({ error: 'Group name is required' });
@@ -351,7 +353,18 @@ class ChatController {
 
       // Include creator in participants
       const inputParticipants = Array.isArray(participant_ids) ? participant_ids : [];
-      const participants = [...new Set([creator_id, ...inputParticipants])];
+      const baseParticipants = [];
+      if (isValidObjectId(creator_id_raw)) baseParticipants.push(creator_id_raw);
+      for (const p of inputParticipants) {
+        if (isValidObjectId(p)) baseParticipants.push(p);
+      }
+      const participants = Array.from(new Set(baseParticipants));
+
+      if (participants.length === 0) {
+        return res.status(400).json({ error: 'No valid participant ids provided' });
+      }
+
+      const creator_id = isValidObjectId(creator_id_raw) ? creator_id_raw : participants[0];
 
       const groupChat = new Chat({
         name: name,
