@@ -50,7 +50,8 @@ router.get('/list', authenticate, async (req, res) => {
   }
 });
 
-// GET /api/chats/messages/:chatId with pagination shape { success, messages, pagination }
+// GET /api/chat/messages/:chatId (primary endpoint for mobile)
+// GET /api/chats/messages/:chatId (legacy alias)
 router.get('/messages/:chatId', authenticate, async (req, res) => {
   try {
     const chatId = req.params.chatId;
