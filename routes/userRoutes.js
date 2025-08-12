@@ -17,6 +17,24 @@ router.get('/test', (req, res) => {
   });
 });
 
+// Get current authenticated user (normalized) - requires auth
+router.get('/me', authenticate, async (req, res) => {
+  try {
+    const userId = req.user?._id || req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
+
+    const user = await User.findById(userId).lean();
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    return res.json(normalizeUser(user));
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to get current user', error: error.message });
+  }
+});
+
 // Helper: normalize user cho mobile. Fallback các trường cho core User mới
 const normalizeUser = (u) => ({
   _id: u._id,
