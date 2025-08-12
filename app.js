@@ -200,10 +200,9 @@ const userRoutes = require('./routes/userRoutes');
 // Use routes
 app.use("/api/chat", chatRoutes);
 app.use("/api/messages", messageRoutes);
-// Backward-compatible aliases to support legacy mobile paths
+// Backward-compatible aliases to support legacy mobile paths  
 app.use("/api/chats", chatRoutes);
-// Separate message routes to avoid conflicts
-app.use("/api/chats", messageRoutes);
+// Note: messageRoutes chỉ mount tại /api/messages để tránh conflict với chatRoutes
 app.use("/api/method", chatRoutes);
 app.use("/api/resource", chatRoutes);
 app.use("/api/admin", adminRoutes);

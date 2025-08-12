@@ -8,6 +8,21 @@ const path = require('path');
 const Message = require('../models/Message');
 const Chat = require('../models/Chat');
 
+// Debug endpoint to test API connectivity
+router.get('/test', async (req, res) => {
+  try {
+    res.json({ 
+      success: true, 
+      message: 'Chat API is working!', 
+      timestamp: new Date().toISOString(),
+      service: 'chat-service',
+      version: '1.0.0'
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // Chat management routes (with authentication)
 router.post('/create-or-get', authenticate, chatController.createOrGetChat.bind(chatController));
 router.get('/user/:user_id', authenticate, chatController.getUserChats.bind(chatController));
