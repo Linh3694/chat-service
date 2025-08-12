@@ -47,7 +47,8 @@ userSchema.statics.updateFromFrappe = async function updateFromFrappe(frappeUser
     frappeUser.name;
 
   const email = frappeUser.email || frappeUser.user_id || frappeUser.username || undefined;
-  const avatarUrl = frappeUser.user_image || frappeUser.avatar || frappeUser.avatar_url || undefined;
+  // Fallback user_image cho core User mới
+  const avatarUrl = frappeUser.user_image || frappeUser.userImage || frappeUser.avatar || frappeUser.avatar_url || undefined;
 
   const roles = Array.isArray(frappeUser.roles)
     ? frappeUser.roles.map((r) => (typeof r === 'string' ? r : r?.role)).filter(Boolean)

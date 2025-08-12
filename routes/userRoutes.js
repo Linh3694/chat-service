@@ -6,14 +6,15 @@ const redisClient = require('../config/redis');
 const frappeService = require('../services/frappeService');
 const { authenticate } = require('../middleware/authMiddleware');
 
-// Helper: normalize user for mobile
+// Helper: normalize user cho mobile. Fallback các trường cho core User mới
 const normalizeUser = (u) => ({
   _id: u._id,
   fullname: u.fullname || u.fullName || u.full_name || u.name || '',
-  email: u.email || '',
-  avatarUrl: u.avatarUrl || u.userImage || u.avatar || '',
-  department: u.department || '',
-  designation: u.designation || '',
+  email: u.email || u.user_id || '',
+  avatarUrl: u.avatarUrl || u.userImage || u.user_image || u.avatar || '',
+  // Các trường sau có thể không còn trong core → để rỗng nếu không có
+  department: u.department || u?.metadata?.department || '',
+  designation: u.designation || u?.metadata?.designation || '',
 });
 
 // GET /api/users → list users

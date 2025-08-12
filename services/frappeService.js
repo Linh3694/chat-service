@@ -7,7 +7,8 @@ class FrappeService {
     this.baseURL = process.env.FRAPPE_API_URL || 'http://172.16.20.130:8000';
     this.apiKey = process.env.FRAPPE_API_KEY;
     this.apiSecret = process.env.FRAPPE_API_SECRET;
-    this.enabled = process.env.ENABLE_FRAPPE_SYNC === 'true';
+    // Bật mặc định nếu không cấu hình để tránh ngắt luồng đồng bộ khi thiếu biến môi trường
+    this.enabled = (process.env.ENABLE_FRAPPE_SYNC || 'true') === 'true';
     this.authCache = new Map(); // token -> { user, exp }
     this.cacheTtlMs = parseInt(process.env.FRAPPE_AUTH_CACHE_TTL_MS || '60000', 10); // default 60s
     
@@ -89,23 +90,58 @@ class FrappeService {
         throw new Error('Frappe sync is disabled');
       }
 
-      const params = {
+      // Một số trường tuỳ biến (role/department/designation) có thể không còn ở core User
+      // Thử trước với danh sách đầy đủ, nếu lỗi sẽ fallback sang danh sách tối thiểu an toàn
+      const preferredFields = [
+        'name', 'full_name', 'email', 'user_image', 'enabled',
+        // Các trường bên dưới có thể không tồn tại trong core User mới
+        'role', 'department', 'designation', 'mobile_no', 'phone', 'creation', 'modified'
+      ];
+      const minimalFields = ['name', 'full_name', 'email', 'user_image', 'enabled'];
+
+      const buildParams = (fields) => ({
         limit_page_length: limit,
-        fields: JSON.stringify([
-          'name', 'full_name', 'email', 'user_image', 
-          'enabled', 'role', 'department', 'designation',
-          'mobile_no', 'phone', 'creation', 'modified'
-        ]),
+        fields: JSON.stringify(fields),
         ...filters
+      });
+
+      const tryFetch = async (fields) => {
+        const endpoints = ['/api/resource/User', '/api/resource/Core%20User'];
+        let lastErr = null;
+        for (const ep of endpoints) {
+          try {
+            const response = await this.api.get(ep, { params: buildParams(fields) });
+            if (response.data && response.data.data) {
+              return response.data.data;
+            }
+          } catch (err) {
+            lastErr = err;
+            // Nếu endpoint không tồn tại (404), thử endpoint tiếp theo
+            if (err?.response?.status && err.response.status !== 404) {
+              // các lỗi khác giữ nguyên để xử lý bên ngoài
+            }
+          }
+        }
+        if (lastErr) throw lastErr;
+        return [];
       };
 
-      const response = await this.api.get('/api/resource/User', { params });
-      
-      if (response.data && response.data.data) {
-        return response.data.data;
+      try {
+        return await tryFetch(preferredFields);
+      } catch (e) {
+        // Nếu lỗi do trường không hợp lệ hoặc các lỗi 4xx khác, thử lại với gói tối thiểu
+        const status = e?.response?.status;
+        const body = e?.response?.data;
+        const maybeInvalidField = status >= 400 && status < 500;
+        if (maybeInvalidField) {
+          console.warn('⚠️  [Frappe Service] getAllUsers retrying with minimal fields due to error:', {
+            status,
+            bodyPreview: typeof body === 'string' ? body.slice(0, 300) : JSON.stringify(body || {}).slice(0, 300)
+          });
+          return await tryFetch(minimalFields);
+        }
+        throw e;
       }
-      
-      return [];
     } catch (error) {
       console.error('❌ [Frappe Service] Failed to get all users:', error.message);
       throw error;
