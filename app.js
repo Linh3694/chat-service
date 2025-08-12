@@ -200,14 +200,13 @@ const userRoutes = require('./routes/userRoutes');
 // Use routes
 app.use("/api/chat", chatRoutes);
 app.use("/api/chat", messageRoutes);
-app.use("/api/chat/users", userRoutes); // Users endpoint under chat
 // Backward-compatible aliases to support legacy mobile paths
 app.use("/api/chats", chatRoutes);
 app.use("/api/chats", messageRoutes);
 app.use("/api/method", chatRoutes);
 app.use("/api/resource", chatRoutes);
 app.use("/api/admin", adminRoutes);
-app.use("/api/users", userRoutes); // Giữ lại để backward compatible
+app.use("/api/users", userRoutes); // Users API cho mobile
 
 // Socket.IO events for real-time chat with enhanced features
 io.on('connection', (socket) => {
